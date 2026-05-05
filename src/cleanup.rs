@@ -1,10 +1,14 @@
+use std::collections::{HashMap, HashSet};
 use std::io::{self, IsTerminal, Write};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::process::Command;
+use std::thread;
 
 use anyhow::{Context, Result, anyhow};
+use serde::Serialize;
 
 use crate::git::{current_worktree_root, default_branch, git_output, git_status, list_worktrees};
+use crate::path_to_str;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct CleanupInput {
@@ -16,7 +20,7 @@ pub struct CleanupInput {
     pub merged_to_default: bool,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
 pub enum CleanupDisposition {
     SafeDelete,
     SkipCurrent,
@@ -24,7 +28,7 @@ pub enum CleanupDisposition {
     SkipUnmerged,
 }
 
-pub fn classify_cleanup_candidate(input: CleanupInput) -> CleanupDisposition {
+pub fn classify_cleanup_candidate(input: &CleanupInput) -> CleanupDisposition {
     if input.is_current_worktree {
         return CleanupDisposition::SkipCurrent;
     }
@@ -38,12 +42,6 @@ pub fn classify_cleanup_candidate(input: CleanupInput) -> CleanupDisposition {
     }
 }
 
-#[derive(Debug, Clone)]
-pub struct CleanupCandidate {
-    pub input: CleanupInput,
-    pub disposition: CleanupDisposition,
-}
-
 #[derive(Debug, Clone, Copy)]
 pub struct CleanupOptions {
     pub dry_run: bool,
@@ -54,17 +52,20 @@ pub struct CleanupOptions {
 
 pub fn run_cleanup(options: CleanupOptions) -> Result<()> {
     let candidates = discover_cleanup_candidates()?;
-    let safe: Vec<_> = candidates
-        .iter()
-        .filter(|candidate| {
-            candidate.disposition == CleanupDisposition::SafeDelete || options.force
-        })
-        .collect();
 
     if options.json {
         print_cleanup_json(&candidates)?;
         return Ok(());
     }
+
+    let safe: Vec<&CleanupInput> = candidates
+        .iter()
+        .filter(|input| match classify_cleanup_candidate(input) {
+            CleanupDisposition::SafeDelete => true,
+            CleanupDisposition::SkipCurrent => false,
+            CleanupDisposition::SkipDirty | CleanupDisposition::SkipUnmerged => options.force,
+        })
+        .collect();
 
     if safe.is_empty() {
         println!("git-ws: nothing to clean");
@@ -72,14 +73,13 @@ pub fn run_cleanup(options: CleanupOptions) -> Result<()> {
     }
 
     println!("git-ws: cleanup candidates");
-    for (index, candidate) in safe.iter().enumerate() {
-        let path = candidate
-            .input
+    for (index, input) in safe.iter().enumerate() {
+        let path = input
             .worktree_path
             .as_ref()
             .map(|path| path.display().to_string())
             .unwrap_or_else(|| "-".to_string());
-        println!("  {}. {} {}", index + 1, candidate.input.branch, path);
+        println!("  {}. {} {}", index + 1, input.branch, path);
     }
 
     if options.dry_run {
@@ -93,54 +93,76 @@ pub fn run_cleanup(options: CleanupOptions) -> Result<()> {
     };
 
     for index in selected {
-        let candidate = safe[index];
-        delete_cleanup_candidate(candidate, options.force)?;
+        delete_cleanup_candidate(safe[index], options.force)?;
     }
 
     Ok(())
 }
 
-pub fn discover_cleanup_candidates() -> Result<Vec<CleanupCandidate>> {
-    let current_root = current_worktree_root()?;
-    let worktrees = list_worktrees()?;
-    let merged = merged_branches()?;
-    let gone = gone_branches()?;
-    let mut candidates = Vec::new();
+pub fn discover_cleanup_candidates() -> Result<Vec<CleanupInput>> {
+    let (current_root, worktrees, merged, local) = thread::scope(|scope| -> Result<_> {
+        let current_root = scope.spawn(current_worktree_root);
+        let worktrees = scope.spawn(list_worktrees);
+        let merged = scope.spawn(merged_branches);
+        let local = scope.spawn(local_branches_with_track);
+        Ok((
+            current_root.join().expect("current_worktree_root thread")?,
+            worktrees.join().expect("list_worktrees thread")?,
+            merged.join().expect("merged_branches thread")?,
+            local.join().expect("local_branches_with_track thread")?,
+        ))
+    })?;
+    let merged: HashSet<String> = merged.into_iter().collect();
 
-    for branch in local_branch_names()? {
-        let worktree_path = worktrees
+    let dirty_paths = check_worktrees_dirty(&worktrees);
+
+    Ok(local
+        .into_iter()
+        .map(|(branch, upstream_gone)| {
+            let worktree_path = worktrees
+                .iter()
+                .find(|worktree| worktree.branch.as_deref() == Some(branch.as_str()))
+                .map(|worktree| worktree.path.clone());
+            let is_current_worktree = worktree_path.as_ref() == Some(&current_root);
+            let is_dirty = worktree_path
+                .as_ref()
+                .is_some_and(|path| dirty_paths.get(path).copied().unwrap_or(false));
+            CleanupInput {
+                upstream_gone,
+                merged_to_default: merged.contains(&branch),
+                branch,
+                worktree_path,
+                is_current_worktree,
+                is_dirty,
+            }
+        })
+        .collect())
+}
+
+fn check_worktrees_dirty(worktrees: &[crate::git::Worktree]) -> HashMap<PathBuf, bool> {
+    let paths: Vec<PathBuf> = worktrees
+        .iter()
+        .map(|worktree| worktree.path.clone())
+        .collect();
+    thread::scope(|scope| {
+        let handles: Vec<_> = paths
             .iter()
-            .find(|worktree| worktree.branch.as_deref() == Some(branch.as_str()))
-            .map(|worktree| worktree.path.clone());
-        let is_current_worktree = worktree_path.as_ref() == Some(&current_root);
-        let is_dirty = worktree_path
-            .as_ref()
-            .is_some_and(|path| !worktree_clean(path).unwrap_or(false));
-        let input = CleanupInput {
-            upstream_gone: gone.iter().any(|gone_branch| gone_branch == &branch),
-            merged_to_default: merged.iter().any(|merged_branch| merged_branch == &branch),
-            branch,
-            worktree_path,
-            is_current_worktree,
-            is_dirty,
-        };
-        let disposition = classify_cleanup_candidate(input.clone());
-        candidates.push(CleanupCandidate { input, disposition });
-    }
-
-    Ok(candidates)
+            .map(|path| {
+                let path = path.clone();
+                scope.spawn(move || {
+                    let is_dirty = !worktree_clean(&path).unwrap_or(false);
+                    (path, is_dirty)
+                })
+            })
+            .collect();
+        handles
+            .into_iter()
+            .map(|handle| handle.join().expect("worktree_clean thread"))
+            .collect()
+    })
 }
 
-fn local_branch_names() -> Result<Vec<String>> {
-    Ok(
-        git_output(["for-each-ref", "--format=%(refname:short)", "refs/heads"])?
-            .lines()
-            .map(ToString::to_string)
-            .collect(),
-    )
-}
-
-fn gone_branches() -> Result<Vec<String>> {
+fn local_branches_with_track() -> Result<Vec<(String, bool)>> {
     Ok(git_output([
         "for-each-ref",
         "--format=%(refname:short)%09%(upstream:track)",
@@ -149,13 +171,17 @@ fn gone_branches() -> Result<Vec<String>> {
     .lines()
     .filter_map(|line| {
         let (branch, track) = line.split_once('\t')?;
-        track.contains("[gone]").then(|| branch.to_string())
+        Some((branch.to_string(), track.contains("[gone]")))
     })
     .collect())
 }
 
 fn merged_branches() -> Result<Vec<String>> {
     let default = default_branch();
+    let default_local = default
+        .strip_prefix("origin/")
+        .unwrap_or(&default)
+        .to_string();
     let output = match git_output([
         "branch",
         "--format=%(refname:short)",
@@ -165,15 +191,15 @@ fn merged_branches() -> Result<Vec<String>> {
         Ok(output) => output,
         Err(_) => return Ok(Vec::new()),
     };
-
+    let protected: HashSet<&str> = ["main", "master", "develop", default_local.as_str()].into();
     Ok(output
         .lines()
         .map(|line| line.trim_start_matches('*').trim().to_string())
-        .filter(|branch| !matches!(branch.as_str(), "main" | "master" | "develop"))
+        .filter(|branch| !branch.is_empty() && !protected.contains(branch.as_str()))
         .collect())
 }
 
-fn worktree_clean(path: &PathBuf) -> Result<bool> {
+fn worktree_clean(path: &Path) -> Result<bool> {
     let output = Command::new("git")
         .arg("-C")
         .arg(path)
@@ -212,31 +238,39 @@ fn prompt_cleanup_selection(max: usize) -> Result<Vec<usize>> {
     Ok(selected)
 }
 
-fn delete_cleanup_candidate(candidate: &CleanupCandidate, force: bool) -> Result<()> {
-    if let Some(path) = &candidate.input.worktree_path {
-        git_status(["worktree", "remove", path.to_str().unwrap_or_default()])?;
+fn delete_cleanup_candidate(input: &CleanupInput, force: bool) -> Result<()> {
+    if let Some(path) = &input.worktree_path {
+        git_status(["worktree", "remove", path_to_str(path)?])?;
     }
-    if force {
-        git_status(["branch", "-D", candidate.input.branch.as_str()])
-    } else {
-        git_status(["branch", "-d", candidate.input.branch.as_str()])
-            .or_else(|_| git_status(["branch", "-D", candidate.input.branch.as_str()]))
-    }
+    let flag = if force { "-D" } else { "-d" };
+    git_status(["branch", flag, input.branch.as_str()])
 }
 
-fn print_cleanup_json(candidates: &[CleanupCandidate]) -> Result<()> {
-    let values: Vec<_> = candidates
+#[derive(Serialize)]
+struct CleanupRecord<'a> {
+    branch: &'a str,
+    #[serde(rename = "worktreePath")]
+    worktree_path: Option<&'a Path>,
+    disposition: CleanupDisposition,
+    #[serde(rename = "upstreamGone")]
+    upstream_gone: bool,
+    #[serde(rename = "mergedToDefault")]
+    merged_to_default: bool,
+    dirty: bool,
+    current: bool,
+}
+
+fn print_cleanup_json(inputs: &[CleanupInput]) -> Result<()> {
+    let values: Vec<CleanupRecord> = inputs
         .iter()
-        .map(|candidate| {
-            serde_json::json!({
-                "branch": candidate.input.branch,
-                "worktreePath": candidate.input.worktree_path,
-                "disposition": format!("{:?}", candidate.disposition),
-                "upstreamGone": candidate.input.upstream_gone,
-                "mergedToDefault": candidate.input.merged_to_default,
-                "dirty": candidate.input.is_dirty,
-                "current": candidate.input.is_current_worktree,
-            })
+        .map(|input| CleanupRecord {
+            branch: input.branch.as_str(),
+            worktree_path: input.worktree_path.as_deref(),
+            disposition: classify_cleanup_candidate(input),
+            upstream_gone: input.upstream_gone,
+            merged_to_default: input.merged_to_default,
+            dirty: input.is_dirty,
+            current: input.is_current_worktree,
         })
         .collect();
     println!("{}", serde_json::to_string_pretty(&values)?);

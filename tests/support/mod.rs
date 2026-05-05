@@ -93,6 +93,28 @@ pub fn command_output<const N: usize>(cwd: &Path, args: [&str; N]) -> Output {
         .expect("run git-ws")
 }
 
+pub fn command_output_with_path<const N: usize>(
+    cwd: &Path,
+    extra_path: &Path,
+    args: [&str; N],
+) -> Output {
+    Command::new(env!("CARGO_BIN_EXE_git-ws"))
+        .current_dir(cwd)
+        .env("PATH", prepend_path(extra_path))
+        .args(args)
+        .output()
+        .expect("run git-ws")
+}
+
+#[track_caller]
+pub fn assert_success(output: &Output) {
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+}
+
 pub fn git<const N: usize>(cwd: &Path, args: [&str; N]) -> Output {
     let output = Command::new("git")
         .current_dir(cwd)

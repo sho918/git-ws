@@ -2,10 +2,8 @@ mod support;
 
 use std::fs;
 use std::os::unix::fs::PermissionsExt;
-use std::path::Path;
-use std::process::Command;
 
-use support::{TestRepo, prepend_path};
+use support::{TestRepo, assert_success, command_output_with_path};
 
 #[test]
 fn issue_creates_slugged_worktree_without_network() {
@@ -20,18 +18,10 @@ exit 1
 "#,
     );
 
-    let output = Command::new(env!("CARGO_BIN_EXE_git-ws"))
-        .current_dir(repo.path())
-        .env("PATH", prepend_path(fake_bin.path()))
-        .args(["issue", "42", "--no-init"])
-        .output()
-        .expect("run git-ws");
+    let output =
+        command_output_with_path(repo.path(), fake_bin.path(), ["issue", "42", "--no-init"]);
 
-    assert!(
-        output.status.success(),
-        "{}",
-        String::from_utf8_lossy(&output.stderr)
-    );
+    assert_success(&output);
     let path = String::from_utf8_lossy(&output.stdout).trim().to_string();
     assert!(path.ends_with(".worktrees/issue-42-fix-worktree-cleanup"));
 }
@@ -50,18 +40,9 @@ exit 1
 "#,
     );
 
-    let output = Command::new(env!("CARGO_BIN_EXE_git-ws"))
-        .current_dir(repo.path())
-        .env("PATH", prepend_path(fake_bin.path()))
-        .args(["pr", "7", "--no-init"])
-        .output()
-        .expect("run git-ws");
+    let output = command_output_with_path(repo.path(), fake_bin.path(), ["pr", "7", "--no-init"]);
 
-    assert!(
-        output.status.success(),
-        "{}",
-        String::from_utf8_lossy(&output.stderr)
-    );
+    assert_success(&output);
     let path = String::from_utf8_lossy(&output.stdout).trim().to_string();
     assert!(path.ends_with(".worktrees/feature-pr-head"));
 }
@@ -80,20 +61,35 @@ exit 1
 "#,
     );
 
-    let output = Command::new(env!("CARGO_BIN_EXE_git-ws"))
-        .current_dir(repo.path())
-        .env("PATH", prepend_path(fake_bin.path()))
-        .args(["pr", "9", "--no-init"])
-        .output()
-        .expect("run git-ws");
+    let output = command_output_with_path(repo.path(), fake_bin.path(), ["pr", "9", "--no-init"]);
 
-    assert!(
-        output.status.success(),
-        "{}",
-        String::from_utf8_lossy(&output.stderr)
-    );
+    assert_success(&output);
     let path = String::from_utf8_lossy(&output.stdout).trim().to_string();
     assert!(path.ends_with(".worktrees/pr-9-external-contribution"));
+}
+
+#[test]
+fn fork_pr_reuses_existing_worktree_before_fetching_pull_ref() {
+    let repo = TestRepo::with_remote();
+    repo.create_pull_ref(11);
+    let fake_bin = fake_gh(
+        r#"
+if [ "$1" = "pr" ]; then
+  printf '{"number":11,"title":"External Reuse","headRefName":"fork-branch","isCrossRepository":true}'
+  exit 0
+fi
+exit 1
+"#,
+    );
+
+    let first = command_output_with_path(repo.path(), fake_bin.path(), ["pr", "11", "--no-init"]);
+    assert_success(&first);
+    let first_path = String::from_utf8_lossy(&first.stdout).trim().to_string();
+
+    let second = command_output_with_path(repo.path(), fake_bin.path(), ["pr", "11", "--no-init"]);
+
+    assert_success(&second);
+    assert_eq!(String::from_utf8_lossy(&second.stdout).trim(), first_path);
 }
 
 #[test]
@@ -106,12 +102,8 @@ exit 2
 "#,
     );
 
-    let output = Command::new(env!("CARGO_BIN_EXE_git-ws"))
-        .current_dir(repo.path())
-        .env("PATH", prepend_path(fake_bin.path()))
-        .args(["issue", "42", "--no-init"])
-        .output()
-        .expect("run git-ws");
+    let output =
+        command_output_with_path(repo.path(), fake_bin.path(), ["issue", "42", "--no-init"]);
 
     assert!(!output.status.success());
     assert!(String::from_utf8_lossy(&output.stderr).contains("missing auth"));
@@ -126,6 +118,3 @@ fn fake_gh(script: &str) -> tempfile::TempDir {
     fs::set_permissions(&path, permissions).expect("chmod fake gh");
     dir
 }
-
-#[allow(clippy::needless_pass_by_value)]
-fn _assert_path(_: &Path) {}

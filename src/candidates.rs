@@ -1,4 +1,4 @@
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, HashMap};
 use std::path::PathBuf;
 
 use anyhow::Result;
@@ -9,16 +9,8 @@ use serde::Serialize;
 use crate::git::{Worktree, list_local_branches, list_remote_branches, list_worktrees};
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
-pub struct CandidateAvailability {
-    pub worktree: bool,
-    pub local: bool,
-    pub remote: bool,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct Candidate {
     pub name: String,
-    pub availability: CandidateAvailability,
     pub worktree_path: Option<PathBuf>,
     pub local_ref: Option<String>,
     pub remote_ref: Option<String>,
@@ -50,9 +42,9 @@ impl CandidateFilter {
     fn accepts(self, candidate: &Candidate) -> bool {
         match self {
             Self::All => true,
-            Self::Worktree => candidate.availability.worktree,
-            Self::Local => candidate.availability.local,
-            Self::Remote => candidate.availability.remote,
+            Self::Worktree => candidate.worktree_path.is_some(),
+            Self::Local => candidate.local_ref.is_some(),
+            Self::Remote => candidate.remote_ref.is_some(),
         }
     }
 }
@@ -61,11 +53,6 @@ impl Candidate {
     fn new(name: String) -> Self {
         Self {
             name,
-            availability: CandidateAvailability {
-                worktree: false,
-                local: false,
-                remote: false,
-            },
             worktree_path: None,
             local_ref: None,
             remote_ref: None,
@@ -87,22 +74,30 @@ impl Candidate {
     }
 
     pub fn availability_label(&self) -> String {
+        fn flag(set: bool, on: char) -> char {
+            if set { on } else { ' ' }
+        }
         format!(
             "[{}][{}][{}]",
-            if self.availability.worktree { "W" } else { " " },
-            if self.availability.local { "L" } else { " " },
-            if self.availability.remote { "R" } else { " " },
+            flag(self.worktree_path.is_some(), 'W'),
+            flag(self.local_ref.is_some(), 'L'),
+            flag(self.remote_ref.is_some(), 'R'),
         )
     }
 }
 
 pub fn load_candidates(filter: CandidateFilter) -> Result<Vec<Candidate>> {
-    let candidates = merge_candidates(
-        list_worktrees()?,
-        list_local_branches()?,
-        list_remote_branches()?,
-    );
-    Ok(candidates
+    let (worktrees, local, remote) = std::thread::scope(|scope| -> Result<_> {
+        let worktrees = scope.spawn(list_worktrees);
+        let local = scope.spawn(list_local_branches);
+        let remote = scope.spawn(list_remote_branches);
+        Ok((
+            worktrees.join().expect("list_worktrees thread")?,
+            local.join().expect("list_local_branches thread")?,
+            remote.join().expect("list_remote_branches thread")?,
+        ))
+    })?;
+    Ok(merge_candidates(worktrees, local, remote)
         .into_iter()
         .filter(|candidate| filter.accepts(candidate))
         .collect())
@@ -122,7 +117,6 @@ pub fn merge_candidates(
         let candidate = candidates
             .entry(branch.clone())
             .or_insert_with(|| Candidate::new(branch));
-        candidate.availability.worktree = true;
         candidate.worktree_path = Some(worktree.path);
         candidate.worktree_head = worktree.head;
     }
@@ -131,7 +125,6 @@ pub fn merge_candidates(
         let candidate = candidates
             .entry(branch.clone())
             .or_insert_with(|| Candidate::new(branch.clone()));
-        candidate.availability.local = true;
         candidate.local_ref = Some(branch);
         candidate.upstream = upstream;
         candidate.local_head = Some(head);
@@ -141,7 +134,6 @@ pub fn merge_candidates(
         let candidate = candidates
             .entry(name.clone())
             .or_insert_with(|| Candidate::new(name));
-        candidate.availability.remote = true;
         candidate.remote_ref = Some(remote_ref);
         candidate.remote_head = Some(head);
     }
@@ -149,29 +141,49 @@ pub fn merge_candidates(
     candidates.into_values().collect()
 }
 
-pub fn rank_candidates<'a>(query: &str, candidates: &'a [Candidate]) -> Vec<&'a Candidate> {
-    if query.trim().is_empty() {
-        return candidates.iter().collect();
+pub struct CandidateIndex<'a> {
+    candidates: &'a [Candidate],
+    names: Vec<&'a str>,
+    by_name: HashMap<&'a str, &'a Candidate>,
+    matcher: Matcher,
+}
+
+impl<'a> CandidateIndex<'a> {
+    pub fn new(candidates: &'a [Candidate]) -> Self {
+        let names: Vec<&str> = candidates
+            .iter()
+            .map(|candidate| candidate.name.as_str())
+            .collect();
+        let by_name: HashMap<&str, &Candidate> = candidates
+            .iter()
+            .map(|candidate| (candidate.name.as_str(), candidate))
+            .collect();
+        Self {
+            candidates,
+            names,
+            by_name,
+            matcher: Matcher::new(Config::DEFAULT.match_paths()),
+        }
     }
 
-    let mut matcher = Matcher::new(Config::DEFAULT.match_paths());
-    let pattern = Pattern::new(
-        query,
-        CaseMatching::Smart,
-        Normalization::Smart,
-        AtomKind::Fuzzy,
-    );
-    let names: Vec<&str> = candidates
-        .iter()
-        .map(|candidate| candidate.name.as_str())
-        .collect();
-    pattern
-        .match_list(names, &mut matcher)
-        .into_iter()
-        .filter_map(|(name, _score)| {
-            candidates
-                .iter()
-                .find(|candidate| candidate.name.as_str() == name)
-        })
-        .collect()
+    pub fn rank(&mut self, query: &str) -> Vec<&'a Candidate> {
+        if query.trim().is_empty() {
+            return self.candidates.iter().collect();
+        }
+        let pattern = Pattern::new(
+            query,
+            CaseMatching::Smart,
+            Normalization::Smart,
+            AtomKind::Fuzzy,
+        );
+        pattern
+            .match_list(self.names.iter().copied(), &mut self.matcher)
+            .into_iter()
+            .filter_map(|(name, _score)| self.by_name.get(name).copied())
+            .collect()
+    }
+}
+
+pub fn rank_candidates<'a>(query: &str, candidates: &'a [Candidate]) -> Vec<&'a Candidate> {
+    CandidateIndex::new(candidates).rank(query)
 }

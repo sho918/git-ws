@@ -1,4 +1,5 @@
 use std::collections::BTreeMap;
+use std::collections::hash_map::DefaultHasher;
 use std::env;
 use std::fs;
 use std::hash::{Hash, Hasher};
@@ -145,29 +146,10 @@ fn git_config_value(key: &str) -> Option<String> {
 }
 
 fn init_hash(file_config: &FileConfig) -> String {
-    let mut hasher = Fnv64::default();
+    let mut hasher = DefaultHasher::new();
     file_config.worktree_base_dir.hash(&mut hasher);
     file_config.init_commands.hash(&mut hasher);
     format!("{:016x}", hasher.finish())
-}
-
-#[derive(Default)]
-struct Fnv64(u64);
-
-impl Hasher for Fnv64 {
-    fn finish(&self) -> u64 {
-        self.0
-    }
-
-    fn write(&mut self, bytes: &[u8]) {
-        if self.0 == 0 {
-            self.0 = 0xcbf29ce484222325;
-        }
-        for byte in bytes {
-            self.0 ^= u64::from(*byte);
-            self.0 = self.0.wrapping_mul(0x100000001b3);
-        }
-    }
 }
 
 fn trust_store_path() -> Result<PathBuf> {

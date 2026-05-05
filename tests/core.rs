@@ -1,8 +1,6 @@
 use std::path::PathBuf;
 
-use git_ws::candidates::{
-    Candidate, CandidateAvailability, CandidateFilter, merge_candidates, rank_candidates,
-};
+use git_ws::candidates::{Candidate, CandidateFilter, merge_candidates, rank_candidates};
 use git_ws::cleanup::{CleanupDisposition, CleanupInput, classify_cleanup_candidate};
 use git_ws::config::{FileConfig, GitConfig, load_file_config, resolve_base_dir};
 use git_ws::git::{Worktree, parse_worktree_porcelain};
@@ -87,11 +85,6 @@ fn merges_worktree_local_and_remote_candidates_by_branch_name() {
         candidates,
         vec![Candidate {
             name: "feature/demo".to_string(),
-            availability: CandidateAvailability {
-                worktree: true,
-                local: true,
-                remote: true,
-            },
             worktree_path: Some(PathBuf::from("/repo/.worktrees/feature")),
             local_ref: Some("feature/demo".to_string()),
             remote_ref: Some("origin/feature/demo".to_string()),
@@ -129,11 +122,6 @@ fn candidate_filter_accepts_documented_aliases() {
 fn candidate_display_prefers_worktree_then_upstream_then_remote() {
     let mut candidate = Candidate {
         name: "feature/demo".to_string(),
-        availability: CandidateAvailability {
-            worktree: true,
-            local: true,
-            remote: true,
-        },
         worktree_path: Some(PathBuf::from("/repo/.worktrees/demo")),
         local_ref: Some("feature/demo".to_string()),
         remote_ref: Some("origin/feature/demo".to_string()),
@@ -237,6 +225,7 @@ fn path_segment_replaces_branch_separators() {
         "feature-worktree-cleanup"
     );
     assert_eq!(path_segment_for_branch("issue/123.fix"), "issue-123-fix");
+    assert_eq!(path_segment_for_branch("機能/修正"), "機能-修正");
 }
 
 #[test]
@@ -254,7 +243,7 @@ fn slugifies_github_titles_for_branch_names() {
 #[test]
 fn cleanup_keeps_only_safe_default_candidates() {
     assert_eq!(
-        classify_cleanup_candidate(CleanupInput {
+        classify_cleanup_candidate(&CleanupInput {
             branch: "feature/gone".to_string(),
             worktree_path: Some(PathBuf::from("/repo/.worktrees/gone")),
             is_current_worktree: false,
@@ -266,7 +255,7 @@ fn cleanup_keeps_only_safe_default_candidates() {
     );
 
     assert_eq!(
-        classify_cleanup_candidate(CleanupInput {
+        classify_cleanup_candidate(&CleanupInput {
             branch: "feature/dirty".to_string(),
             worktree_path: Some(PathBuf::from("/repo/.worktrees/dirty")),
             is_current_worktree: false,
@@ -281,7 +270,7 @@ fn cleanup_keeps_only_safe_default_candidates() {
 #[test]
 fn cleanup_classification_protects_current_before_dirty() {
     assert_eq!(
-        classify_cleanup_candidate(CleanupInput {
+        classify_cleanup_candidate(&CleanupInput {
             branch: "feature/current".to_string(),
             worktree_path: Some(PathBuf::from("/repo")),
             is_current_worktree: true,
@@ -296,7 +285,7 @@ fn cleanup_classification_protects_current_before_dirty() {
 #[test]
 fn cleanup_classification_skips_unmerged_branches() {
     assert_eq!(
-        classify_cleanup_candidate(CleanupInput {
+        classify_cleanup_candidate(&CleanupInput {
             branch: "feature/live".to_string(),
             worktree_path: None,
             is_current_worktree: false,
@@ -316,14 +305,18 @@ fn shell_init_supports_documented_shells() {
     assert!(init_script("powershell").is_err());
 }
 
+#[test]
+fn shell_init_uses_side_channel_for_cd_targets() {
+    for shell in ["fish", "zsh", "bash"] {
+        let script = init_script(shell).expect(shell);
+        assert!(script.contains("GIT_WS_CD_FILE"), "{shell} missing env var");
+        assert!(script.contains("mktemp"), "{shell} missing mktemp");
+    }
+}
+
 fn candidate_named(name: &str) -> Candidate {
     Candidate {
         name: name.to_string(),
-        availability: CandidateAvailability {
-            worktree: false,
-            local: true,
-            remote: false,
-        },
         worktree_path: None,
         local_ref: Some(name.to_string()),
         remote_ref: None,

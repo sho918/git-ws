@@ -1,11 +1,16 @@
+use std::collections::hash_map::DefaultHasher;
 use std::fs;
+use std::hash::{Hash, Hasher};
 use std::path::PathBuf;
 use std::process::Command;
 
 use anyhow::{Context, Result, anyhow};
 
 use crate::config::{ensure_init_trusted, load_file_config, load_git_config, resolve_base_dir};
-use crate::git::{branch_exists, default_start_point, ensure_repo, git_status, list_worktrees};
+use crate::git::{
+    branch_exists, default_start_point, emit_cd_path, ensure_repo, git_status, list_worktrees,
+};
+use crate::path_to_str;
 
 #[derive(Debug, Clone)]
 pub struct CreateWorktreeOptions {
@@ -17,7 +22,7 @@ pub struct CreateWorktreeOptions {
 
 pub fn create_worktree(options: CreateWorktreeOptions) -> Result<PathBuf> {
     if let Some(path) = find_worktree_for_branch(&options.branch)? {
-        println!("{}", path.display());
+        emit_cd_path(&path)?;
         return Ok(path);
     }
 
@@ -29,19 +34,18 @@ pub fn create_worktree(options: CreateWorktreeOptions) -> Result<PathBuf> {
         .path
         .unwrap_or_else(|| base_dir.join(path_segment_for_branch(&options.branch)));
 
+    let should_run_init = options.run_init && !file_config.init_commands.is_empty();
+    if should_run_init {
+        ensure_init_trusted(&repo.root, &file_config)?;
+    }
+
     if let Some(parent) = path.parent() {
         fs::create_dir_all(parent)
             .with_context(|| format!("failed to create {}", parent.display()))?;
     }
-
+    let path_str = path_to_str(&path)?;
     if branch_exists(&options.branch) {
-        git_status([
-            "worktree",
-            "add",
-            path.to_str()
-                .ok_or_else(|| anyhow!("worktree path is not UTF-8"))?,
-            options.branch.as_str(),
-        ])?;
+        git_status(["worktree", "add", path_str, options.branch.as_str()])?;
     } else {
         let start = options.start_point.unwrap_or_else(default_start_point);
         git_status([
@@ -49,14 +53,12 @@ pub fn create_worktree(options: CreateWorktreeOptions) -> Result<PathBuf> {
             "add",
             "-b",
             options.branch.as_str(),
-            path.to_str()
-                .ok_or_else(|| anyhow!("worktree path is not UTF-8"))?,
+            path_str,
             start.as_str(),
         ])?;
     }
 
-    if options.run_init && !file_config.init_commands.is_empty() {
-        ensure_init_trusted(&repo.root, &file_config)?;
+    if should_run_init {
         for command in &file_config.init_commands {
             let status = Command::new("sh")
                 .arg("-c")
@@ -70,7 +72,7 @@ pub fn create_worktree(options: CreateWorktreeOptions) -> Result<PathBuf> {
         }
     }
 
-    println!("{}", path.display());
+    emit_cd_path(&path)?;
     Ok(path)
 }
 
@@ -85,13 +87,24 @@ pub fn path_segment_for_branch(branch: &str) -> String {
     let mut out = String::new();
     let mut last_dash = false;
     for ch in branch.chars() {
-        if ch.is_ascii_alphanumeric() {
-            out.push(ch.to_ascii_lowercase());
+        if ch.is_alphanumeric() {
+            out.extend(ch.to_lowercase());
             last_dash = false;
         } else if !last_dash {
             out.push('-');
             last_dash = true;
         }
     }
-    out.trim_matches('-').to_string()
+    let segment = out.trim_matches('-').to_string();
+    if segment.is_empty() {
+        fallback_path_segment(branch)
+    } else {
+        segment
+    }
+}
+
+fn fallback_path_segment(branch: &str) -> String {
+    let mut hasher = DefaultHasher::new();
+    branch.hash(&mut hasher);
+    format!("worktree-{:016x}", hasher.finish())
 }

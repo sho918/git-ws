@@ -3,8 +3,8 @@ use std::process::Command;
 use anyhow::{Context, Result, anyhow};
 use serde::Deserialize;
 
-use crate::git::{git_status, list_remote_branches};
-use crate::worktree::{CreateWorktreeOptions, create_worktree};
+use crate::git::{git_status, ref_exists};
+use crate::worktree::{CreateWorktreeOptions, create_worktree, find_worktree_for_branch};
 
 #[derive(Debug, Deserialize)]
 struct IssueView {
@@ -56,19 +56,21 @@ pub fn create_pr_worktree(id: &str, branch: Option<String>, run_init: bool) -> R
         }
     });
 
+    if find_worktree_for_branch(&branch)?.is_some() {
+        create_worktree(CreateWorktreeOptions {
+            branch,
+            start_point: None,
+            path: None,
+            run_init,
+        })?;
+        return Ok(());
+    }
+
     let start_point = if pr.is_cross_repository {
-        git_status([
-            "fetch",
-            "origin",
-            format!("refs/pull/{}/head:refs/heads/{branch}", pr.number).as_str(),
-        ])?;
+        fetch_into_branch(&format!("refs/pull/{}/head", pr.number), &branch)?;
         None
-    } else if !local_remote_exists(&pr.head_ref_name)? {
-        git_status([
-            "fetch",
-            "origin",
-            format!("{}:refs/heads/{branch}", pr.head_ref_name).as_str(),
-        ])?;
+    } else if !local_remote_exists(&pr.head_ref_name) {
+        fetch_into_branch(&pr.head_ref_name, &branch)?;
         None
     } else {
         Some(format!("origin/{}", pr.head_ref_name))
@@ -84,18 +86,7 @@ pub fn create_pr_worktree(id: &str, branch: Option<String>, run_init: bool) -> R
 }
 
 pub fn slugify_title(title: &str) -> String {
-    let mut out = String::new();
-    let mut last_dash = false;
-    for ch in title.chars() {
-        if ch.is_ascii_alphanumeric() {
-            out.push(ch.to_ascii_lowercase());
-            last_dash = false;
-        } else if !last_dash && !out.is_empty() {
-            out.push('-');
-            last_dash = true;
-        }
-    }
-    let slug = out.trim_matches('-').to_string();
+    let slug = crate::slugify(title);
     if slug.is_empty() {
         "work".to_string()
     } else {
@@ -117,8 +108,14 @@ fn gh_json<const N: usize, T: for<'de> Deserialize<'de>>(args: [&str; N]) -> Res
     serde_json::from_slice(&output.stdout).context("failed to parse gh JSON")
 }
 
-fn local_remote_exists(branch: &str) -> Result<bool> {
-    Ok(list_remote_branches()?
-        .iter()
-        .any(|(name, _remote, _head)| name == branch))
+fn local_remote_exists(branch: &str) -> bool {
+    ref_exists(&format!("refs/remotes/origin/{branch}"))
+}
+
+fn fetch_into_branch(refspec: &str, branch: &str) -> Result<()> {
+    git_status([
+        "fetch",
+        "origin",
+        format!("{refspec}:refs/heads/{branch}").as_str(),
+    ])
 }

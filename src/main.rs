@@ -5,7 +5,7 @@ use std::path::PathBuf;
 use anyhow::{Result, anyhow};
 use git_ws::candidates::{Candidate, CandidateFilter, load_candidates};
 use git_ws::cleanup::{CleanupOptions, run_cleanup};
-use git_ws::git::{branch_exists, current_branch, default_branch, git_status};
+use git_ws::git::{branch_exists, current_branch, default_branch, emit_cd_path, git_status};
 use git_ws::github::{create_issue_worktree, create_pr_worktree};
 use git_ws::picker::pick_candidate;
 use git_ws::shell::init_script;
@@ -38,38 +38,51 @@ fn run() -> Result<()> {
         return cmd_cleanup(args);
     }
     if program.ends_with("git-main") {
-        return cmd_main(args.first().and_then(|arg| arg.to_str()).unwrap_or("main"));
+        let target = match args.first().and_then(|arg| arg.to_str()) {
+            Some("master") => MainTarget::Master,
+            _ => MainTarget::Default,
+        };
+        return cmd_main(target);
     }
 
     let Some(command) = args
         .first()
         .and_then(|arg| arg.to_str())
-        .map(ToString::to_string)
+        .map(str::to_string)
     else {
         return cmd_open(Vec::new());
     };
+    let mut rest = args;
+    rest.remove(0);
 
     match command.as_str() {
         "-h" | "--help" | "help" => {
             print_help();
             Ok(())
         }
-        "open" | "co" => cmd_open(args.into_iter().skip(1).collect()),
-        "list" => cmd_list(args.into_iter().skip(1).collect()),
-        "new" => cmd_new(args.into_iter().skip(1).collect()),
-        "issue" => cmd_issue(args.into_iter().skip(1).collect()),
-        "pr" => cmd_pr(args.into_iter().skip(1).collect()),
-        "cleanup" => cmd_cleanup(args.into_iter().skip(1).collect()),
-        "main" => cmd_main("main"),
-        "master" => cmd_main("master"),
-        "init-shell" => cmd_init_shell(args.into_iter().skip(1).collect()),
+        "open" | "co" => cmd_open(rest),
+        "list" => cmd_list(rest),
+        "new" => cmd_new(rest),
+        "issue" => cmd_issue(rest),
+        "pr" => cmd_pr(rest),
+        "cleanup" => cmd_cleanup(rest),
+        "main" => cmd_main(MainTarget::Default),
+        "master" => cmd_main(MainTarget::Master),
+        "init-shell" => cmd_init_shell(rest),
         "doctor" => cmd_doctor(),
         other => {
-            let mut open_args = vec![OsString::from(other)];
-            open_args.extend(args.into_iter().skip(1));
+            let mut open_args = Vec::with_capacity(rest.len() + 1);
+            open_args.push(OsString::from(other));
+            open_args.extend(rest);
             cmd_open(open_args)
         }
     }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum MainTarget {
+    Default,
+    Master,
 }
 
 fn cmd_open(args: Vec<OsString>) -> Result<()> {
@@ -125,32 +138,39 @@ fn cmd_cleanup(args: Vec<OsString>) -> Result<()> {
     run_cleanup(options)
 }
 
-fn cmd_main(target: &str) -> Result<()> {
-    let branch = if target == "master" {
-        "master".to_string()
-    } else {
-        let default = default_branch();
-        default
-            .strip_prefix("origin/")
-            .unwrap_or(default.as_str())
-            .to_string()
+fn cmd_main(target: MainTarget) -> Result<()> {
+    let branch = match target {
+        MainTarget::Master => "master".to_string(),
+        MainTarget::Default => {
+            let default = default_branch();
+            default
+                .strip_prefix("origin/")
+                .unwrap_or(default.as_str())
+                .to_string()
+        }
     };
     if let Some(path) = find_worktree_for_branch(&branch)? {
-        println!("{}", path.display());
+        emit_cd_path(&path)?;
         return Ok(());
     }
     if current_branch().ok().as_deref() != Some(branch.as_str()) && branch_exists(&branch) {
         git_status(["switch", branch.as_str()])?;
     }
-    println!("{}", std::env::current_dir()?.display());
+    emit_cd_path(&std::env::current_dir()?)?;
     Ok(())
 }
 
 fn cmd_init_shell(args: Vec<OsString>) -> Result<()> {
-    let shell = args
-        .first()
-        .and_then(|arg| arg.to_str())
+    let mut iter = args.into_iter();
+    let shell = iter
+        .next()
         .ok_or_else(|| anyhow!("missing shell: fish, zsh, or bash"))?;
+    if iter.next().is_some() {
+        return Err(anyhow!("init-shell takes a single shell argument"));
+    }
+    let shell = shell
+        .to_str()
+        .ok_or_else(|| anyhow!("shell argument is not UTF-8"))?;
     print!("{}", init_script(shell)?);
     Ok(())
 }
@@ -176,12 +196,12 @@ fn cmd_doctor() -> Result<()> {
 
 fn run_candidate(candidate: Candidate) -> Result<()> {
     if let Some(path) = candidate.worktree_path {
-        println!("{}", path.display());
+        emit_cd_path(&path)?;
         return Ok(());
     }
     if let Some(local) = candidate.local_ref {
         if let Some(path) = find_worktree_for_branch(&local)? {
-            println!("{}", path.display());
+            emit_cd_path(&path)?;
             return Ok(());
         }
         git_status(["switch", local.as_str()])?;

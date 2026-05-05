@@ -1,6 +1,8 @@
+use std::env;
 use std::ffi::OsStr;
-use std::path::PathBuf;
-use std::process::Command;
+use std::fs;
+use std::path::{Path, PathBuf};
+use std::process::{Command, Stdio};
 
 use anyhow::{Context, Result, anyhow};
 use serde::Serialize;
@@ -30,17 +32,8 @@ where
     I: IntoIterator<Item = S>,
     S: AsRef<OsStr>,
 {
-    let output = Command::new("git")
-        .args(args)
-        .output()
-        .context("failed to spawn git")?;
-    if !output.status.success() {
-        return Err(anyhow!(
-            "git failed: {}",
-            String::from_utf8_lossy(&output.stderr).trim()
-        ));
-    }
-    String::from_utf8(output.stdout).context("git output was not UTF-8")
+    let bytes = git_output_bytes(args)?;
+    String::from_utf8(bytes).context("git output was not UTF-8")
 }
 
 pub fn git_output_bytes<I, S>(args: I) -> Result<Vec<u8>>
@@ -66,15 +59,21 @@ where
     I: IntoIterator<Item = S>,
     S: AsRef<OsStr>,
 {
-    let status = Command::new("git")
-        .args(args)
-        .status()
-        .context("failed to spawn git")?;
-    if status.success() {
-        Ok(())
+    git_output_bytes(args).map(drop)
+}
+
+pub fn emit_cd_path(path: &Path) -> Result<()> {
+    if let Some(cd_file) = env::var_os("GIT_WS_CD_FILE") {
+        fs::write(&cd_file, format!("{}\n", path.display())).with_context(|| {
+            format!(
+                "failed to write cd target to {}",
+                PathBuf::from(cd_file).display()
+            )
+        })?;
     } else {
-        Err(anyhow!("git exited with status {status}"))
+        println!("{}", path.display());
     }
+    Ok(())
 }
 
 pub fn list_worktrees() -> Result<Vec<Worktree>> {
@@ -180,37 +179,23 @@ pub fn list_remote_branches() -> Result<Vec<(String, String, String)>> {
 }
 
 pub fn branch_exists(branch: &str) -> bool {
-    Command::new("git")
-        .args(["show-ref", "--verify", "--quiet"])
-        .arg(format!("refs/heads/{branch}"))
-        .status()
-        .is_ok_and(|status| status.success())
+    ref_exists(&format!("refs/heads/{branch}"))
 }
 
 pub fn default_start_point() -> String {
-    for candidate in [
+    first_existing_ref(&[
         "origin/HEAD",
         "origin/main",
         "origin/master",
         "main",
         "master",
         "HEAD",
-    ] {
-        if Command::new("git")
-            .args(["rev-parse", "--verify", "--quiet", candidate])
-            .status()
-            .is_ok_and(|status| status.success())
-        {
-            return candidate.to_string();
-        }
-    }
-    "HEAD".to_string()
+    ])
+    .unwrap_or_else(|| "HEAD".to_string())
 }
 
 pub fn current_worktree_root() -> Result<PathBuf> {
-    Ok(PathBuf::from(
-        git_output(["rev-parse", "--show-toplevel"])?.trim(),
-    ))
+    Ok(ensure_repo()?.root)
 }
 
 pub fn current_branch() -> Result<String> {
@@ -218,16 +203,24 @@ pub fn current_branch() -> Result<String> {
 }
 
 pub fn default_branch() -> String {
-    for candidate in ["origin/main", "origin/master", "main", "master"] {
-        if Command::new("git")
-            .args(["rev-parse", "--verify", "--quiet", candidate])
-            .status()
-            .is_ok_and(|status| status.success())
-        {
-            return candidate.to_string();
-        }
-    }
-    "HEAD".to_string()
+    first_existing_ref(&["origin/main", "origin/master", "main", "master"])
+        .unwrap_or_else(|| "HEAD".to_string())
+}
+
+pub fn ref_exists(refname: &str) -> bool {
+    Command::new("git")
+        .args(["rev-parse", "--verify", "--quiet", refname])
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .status()
+        .is_ok_and(|status| status.success())
+}
+
+fn first_existing_ref(candidates: &[&str]) -> Option<String> {
+    candidates
+        .iter()
+        .find(|candidate| ref_exists(candidate))
+        .map(|candidate| (*candidate).to_string())
 }
 
 pub fn short_branch(refname: &str) -> String {

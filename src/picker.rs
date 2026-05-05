@@ -6,7 +6,9 @@ use crossterm::event::{self, Event, KeyCode, KeyModifiers};
 use crossterm::execute;
 use crossterm::terminal::{self, ClearType};
 
-use crate::candidates::{Candidate, rank_candidates};
+use crate::candidates::{Candidate, CandidateIndex};
+
+const VISIBLE_ROWS: usize = 15;
 
 pub fn pick_candidate(
     candidates: &[Candidate],
@@ -16,8 +18,11 @@ pub fn pick_candidate(
         return Ok(None);
     }
 
+    let mut index = CandidateIndex::new(candidates);
+
     if let Some(query) = initial_query {
-        return Ok(rank_candidates(query, candidates)
+        return Ok(index
+            .rank(query)
             .first()
             .map(|candidate| (*candidate).clone()));
     }
@@ -35,7 +40,7 @@ pub fn pick_candidate(
     let _guard = RawModeGuard::new()?;
 
     loop {
-        let ranked = rank_candidates(&state.query, candidates);
+        let ranked = index.rank(&state.query);
         draw(&state, &ranked)?;
         if let Event::Key(key) = event::read()? {
             match key.code {
@@ -96,7 +101,7 @@ fn draw(state: &PickerState, ranked: &[&Candidate]) -> Result<()> {
     writeln!(stdout, "git ws> {}", state.query)?;
     writeln!(stdout, "Avail      Name                         Detail")?;
     writeln!(stdout, "---------  ---------------------------  ------")?;
-    for (index, candidate) in ranked.iter().take(15).enumerate() {
+    for (index, candidate) in ranked.iter().take(VISIBLE_ROWS).enumerate() {
         let marker = if index == state.selected { ">" } else { " " };
         writeln!(
             stdout,
@@ -117,12 +122,14 @@ fn draw(state: &PickerState, ranked: &[&Candidate]) -> Result<()> {
 }
 
 fn fit(value: &str, width: usize) -> String {
-    if value.len() <= width {
+    let count = value.chars().count();
+    if count <= width {
         format!("{value:<width$}")
     } else if width <= 3 {
-        value[..width].to_string()
+        value.chars().take(width).collect()
     } else {
-        format!("{}...", &value[..width - 3])
+        let head: String = value.chars().take(width - 3).collect();
+        format!("{head}...")
     }
 }
 
