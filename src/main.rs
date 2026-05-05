@@ -1,5 +1,6 @@
 use std::env;
 use std::ffi::OsString;
+use std::io::{self, IsTerminal};
 use std::path::PathBuf;
 
 use anyhow::{Result, anyhow};
@@ -104,6 +105,8 @@ fn cmd_list(args: Vec<OsString>) -> Result<()> {
     let candidates = load_candidates(filter)?;
     if json {
         println!("{}", serde_json::to_string_pretty(&candidates)?);
+    } else if io::stdout().is_terminal() {
+        print_candidate_table(&candidates);
     } else {
         for candidate in candidates {
             println!(
@@ -219,22 +222,38 @@ fn cmd_init_shell(args: Vec<OsString>) -> Result<()> {
 }
 
 fn cmd_doctor() -> Result<()> {
-    println!(
-        "git-ws: git {}",
-        git_ws::git::git_output(["--version"])?.trim()
-    );
-    match std::process::Command::new("gh").arg("--version").output() {
-        Ok(output) if output.status.success() => {
-            let first = String::from_utf8_lossy(&output.stdout)
-                .lines()
-                .next()
-                .unwrap_or("gh available")
-                .to_string();
-            println!("git-ws: {first}");
-        }
-        _ => println!("git-ws: gh unavailable"),
+    let git = git_ws::git::git_output(["--version"])?.trim().to_string();
+    let gh = match std::process::Command::new("gh").arg("--version").output() {
+        Ok(output) if output.status.success() => String::from_utf8_lossy(&output.stdout)
+            .lines()
+            .next()
+            .unwrap_or("gh available")
+            .to_string(),
+        _ => "gh unavailable".to_string(),
+    };
+    if io::stdout().is_terminal() {
+        println!("git-ws doctor");
+        println!("{:<8} {}", "git", git);
+        println!("{:<8} {}", "gh", gh);
+    } else {
+        println!("git-ws: git {git}");
+        println!("git-ws: {gh}");
     }
     Ok(())
+}
+
+fn print_candidate_table(candidates: &[Candidate]) {
+    println!("git-ws worktrees");
+    println!("{:<12} {:<40} Detail", "Status", "Name");
+    println!("{:-<12} {:-<40} {:-<1}", "", "", "");
+    for candidate in candidates {
+        println!(
+            "{:<12} {:<40} {}",
+            candidate.availability_label(),
+            candidate.name,
+            candidate.detail()
+        );
+    }
 }
 
 fn run_candidate(candidate: Candidate) -> Result<()> {

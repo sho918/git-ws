@@ -333,6 +333,56 @@ fn cleanup_uses_origin_head_default_instead_of_current_branch() {
 }
 
 #[test]
+fn cleanup_yes_deletes_default_merged_worktree_from_non_default_head() {
+    let repo = TestRepo::with_remote();
+    let worktree_parent = repo.path().join(".worktrees");
+    std::fs::create_dir_all(&worktree_parent).expect("create worktree parent");
+    let worktree = worktree_parent.join("default-merged");
+    git(
+        repo.path(),
+        [
+            "worktree",
+            "add",
+            "-b",
+            "feature/default-merged",
+            worktree.to_str().expect("worktree path"),
+            "main",
+        ],
+    );
+    std::fs::write(worktree.join("default-merged.txt"), "default\n")
+        .expect("write default merged file");
+    git(&worktree, ["add", "default-merged.txt"]);
+    git(&worktree, ["commit", "-m", "default merged"]);
+    git(
+        repo.path(),
+        [
+            "merge",
+            "--no-ff",
+            "feature/default-merged",
+            "-m",
+            "merge into default",
+        ],
+    );
+    git(repo.path(), ["push", "origin", "main"]);
+    git(repo.path(), ["fetch", "origin"]);
+    git(repo.path(), ["switch", "-c", "feature/current", "HEAD~1"]);
+
+    let output = command_output(repo.path(), ["cleanup", "--yes"]);
+
+    assert_success(&output);
+    assert!(
+        !worktree.exists(),
+        "default-merged worktree should have been removed"
+    );
+    let branches = git(repo.path(), ["branch", "--list", "feature/default-merged"]);
+    assert_eq!(
+        String::from_utf8_lossy(&branches.stdout).trim(),
+        "",
+        "default-merged branch should have been deleted"
+    );
+}
+
+#[test]
 fn cleanup_yes_refuses_unknown_default_branch_instead_of_deleting_trunk() {
     let repo = TestRepo::with_remote();
     git(repo.path(), ["branch", "-m", "main", "trunk"]);

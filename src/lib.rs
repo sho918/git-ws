@@ -9,6 +9,7 @@ pub mod git;
 pub mod github;
 pub mod picker;
 pub mod shell;
+mod tui;
 pub mod worktree;
 
 pub fn slugify(input: &str) -> String {
