@@ -1,7 +1,7 @@
 use anyhow::{Result, anyhow};
-use crossterm::event::{self, Event, KeyCode, KeyModifiers};
+use crossterm::event::{self, Event, KeyCode};
 use nucleo_matcher::pattern::{AtomKind, CaseMatching, Normalization, Pattern};
-use nucleo_matcher::{Config, Matcher, Utf32Str};
+use nucleo_matcher::{Config, Matcher, Utf32String};
 use ratatui::Frame;
 use ratatui::layout::{Constraint, Direction, Layout};
 use ratatui::style::{Color, Modifier, Style};
@@ -10,7 +10,7 @@ use ratatui::widgets::{Cell, Paragraph, Row, Table, TableState, Wrap};
 
 use crate::candidates::Candidate;
 use crate::tui::{
-    self, HIGHLIGHT_SYMBOL, Outcome, TuiTerminal, header_style, label_line, panel,
+    self, HIGHLIGHT_SYMBOL, NavCommand, Outcome, TuiTerminal, header_style, label_line, panel,
     row_highlight_style,
 };
 
@@ -38,6 +38,9 @@ pub fn pick_candidate(
     candidates: &[Candidate],
     initial_query: Option<&str>,
 ) -> Result<Option<Candidate>> {
+    if let Some(query) = initial_query {
+        reject_ambiguous_remote_query(candidates, query)?;
+    }
     let entries: Vec<PickerEntry<Candidate>> =
         candidates.iter().cloned().map(candidate_entry).collect();
     pick_entry(
@@ -52,19 +55,53 @@ pub fn pick_candidate(
     )
 }
 
+fn reject_ambiguous_remote_query(candidates: &[Candidate], query: &str) -> Result<()> {
+    if candidates
+        .iter()
+        .any(|candidate| candidate.remote_ref.as_deref() == Some(query))
+    {
+        return Ok(());
+    }
+    if candidates.iter().any(|candidate| {
+        candidate.name == query
+            && (candidate.worktree_path.is_some() || candidate.local_ref.is_some())
+    }) {
+        return Ok(());
+    }
+
+    let remote_refs: Vec<&str> = candidates
+        .iter()
+        .filter(|candidate| candidate.name == query)
+        .filter_map(|candidate| candidate.remote_ref.as_deref())
+        .collect();
+    if remote_refs.len() <= 1 {
+        return Ok(());
+    }
+
+    Err(anyhow!(
+        "ambiguous remote branch query '{query}'; use one of: {}",
+        remote_refs.join(", ")
+    ))
+}
+
 pub fn pick_entry<T: Clone>(
     entries: &[PickerEntry<T>],
     initial_query: Option<&str>,
     view: PickerView<'_>,
 ) -> Result<Option<T>> {
     if entries.is_empty() {
+        if let Some(query) = initial_query {
+            return Err(anyhow!("no match for query: {query}"));
+        }
         return Ok(None);
     }
 
     if let Some(query) = initial_query {
-        return Ok(rank_entries(query, entries)
-            .first()
-            .map(|entry| entry.value.clone()));
+        let ranked = rank_entries(query, entries);
+        let Some(entry) = ranked.first() else {
+            return Err(anyhow!("no match for query: {query}"));
+        };
+        return Ok(Some(entry.value.clone()));
     }
 
     if !tui::is_interactive() {
@@ -77,45 +114,63 @@ pub fn pick_entry<T: Clone>(
 }
 
 pub fn rank_entries<'a, T>(query: &str, entries: &'a [PickerEntry<T>]) -> Vec<&'a PickerEntry<T>> {
-    if query.trim().is_empty() {
-        return entries.iter().collect();
+    PickerCache::new(entries).rank(query)
+}
+
+struct PickerCache<'a, T> {
+    entries: &'a [PickerEntry<T>],
+    haystacks: Vec<Utf32String>,
+    matcher: Matcher,
+}
+
+impl<'a, T> PickerCache<'a, T> {
+    fn new(entries: &'a [PickerEntry<T>]) -> Self {
+        let haystacks = entries
+            .iter()
+            .map(|entry| Utf32String::from(entry.search_text.as_str()))
+            .collect();
+        Self {
+            entries,
+            haystacks,
+            matcher: Matcher::new(Config::DEFAULT.match_paths()),
+        }
     }
 
-    let pattern = Pattern::new(
-        query,
-        CaseMatching::Smart,
-        Normalization::Smart,
-        AtomKind::Fuzzy,
-    );
-    let mut matcher = Matcher::new(Config::DEFAULT.match_paths());
-    let mut utf32_buffer = Vec::new();
-    let mut scored: Vec<(usize, u32)> = entries
-        .iter()
-        .enumerate()
-        .filter_map(|(index, entry)| {
-            pattern
-                .score(
-                    Utf32Str::new(entry.search_text.as_str(), &mut utf32_buffer),
-                    &mut matcher,
-                )
-                .map(|score| (index, score))
-        })
-        .collect();
-    scored.sort_by_key(|(_, score)| std::cmp::Reverse(*score));
-    scored
-        .into_iter()
-        .map(|(index, _score)| &entries[index])
-        .collect()
+    fn rank(&mut self, query: &str) -> Vec<&'a PickerEntry<T>> {
+        if query.trim().is_empty() {
+            return self.entries.iter().collect();
+        }
+        let pattern = Pattern::new(
+            query,
+            CaseMatching::Smart,
+            Normalization::Smart,
+            AtomKind::Fuzzy,
+        );
+        let mut scored: Vec<(usize, u32)> = Vec::with_capacity(self.haystacks.len());
+        for (index, haystack) in self.haystacks.iter().enumerate() {
+            if let Some(score) = pattern.score(haystack.slice(..), &mut self.matcher) {
+                scored.push((index, score));
+            }
+        }
+        scored.sort_unstable_by_key(|(_, score)| std::cmp::Reverse(*score));
+        scored
+            .into_iter()
+            .map(|(index, _)| &self.entries[index])
+            .collect()
+    }
 }
 
 fn run_picker<T: Clone>(entries: &[PickerEntry<T>], view: PickerView<'_>) -> Result<Option<T>> {
     let mut terminal = TuiTerminal::new()?;
     let mut state = PickerState::default();
-    let mut ranked = rank_entries(&state.query, entries);
+    let mut cache = PickerCache::new(entries);
+    let mut ranked = cache.rank(&state.query);
 
     loop {
         state.clamp_selection(ranked.len());
-        terminal.draw(|frame| render_picker(frame, &state, &ranked, view))?;
+        if !event::poll(std::time::Duration::ZERO).unwrap_or(false) {
+            terminal.draw(|frame| render_picker(frame, &state, &ranked, view))?;
+        }
 
         loop {
             match event::read()? {
@@ -130,7 +185,7 @@ fn run_picker<T: Clone>(entries: &[PickerEntry<T>], view: PickerView<'_>) -> Res
                                 command,
                                 PickerCommand::Insert(_) | PickerCommand::Backspace
                             ) {
-                                ranked = rank_entries(&state.query, entries);
+                                ranked = cache.rank(&state.query);
                             }
                             break;
                         }
@@ -203,16 +258,15 @@ enum PickerCommand {
 }
 
 fn picker_command(key: event::KeyEvent) -> PickerCommand {
+    if let Some(nav) = tui::nav_command(key) {
+        return match nav {
+            NavCommand::Up => PickerCommand::Up,
+            NavCommand::Down => PickerCommand::Down,
+            NavCommand::Submit => PickerCommand::Submit,
+            NavCommand::Cancel => PickerCommand::Cancel,
+        };
+    }
     match key.code {
-        KeyCode::Char('c') if key.modifiers.contains(KeyModifiers::CONTROL) => {
-            PickerCommand::Cancel
-        }
-        KeyCode::Char('n') if key.modifiers.contains(KeyModifiers::CONTROL) => PickerCommand::Down,
-        KeyCode::Char('p') if key.modifiers.contains(KeyModifiers::CONTROL) => PickerCommand::Up,
-        KeyCode::Esc => PickerCommand::Cancel,
-        KeyCode::Enter => PickerCommand::Submit,
-        KeyCode::Up => PickerCommand::Up,
-        KeyCode::Down => PickerCommand::Down,
         KeyCode::Backspace => PickerCommand::Backspace,
         KeyCode::Char(ch) => PickerCommand::Insert(ch),
         _ => PickerCommand::Ignore,
@@ -314,11 +368,12 @@ fn render_picker<T>(
 
 fn candidate_entry(candidate: Candidate) -> PickerEntry<Candidate> {
     let name = candidate.name.clone();
+    let detail = candidate.detail();
     PickerEntry {
         marker: candidate.availability_label(),
-        detail: candidate.detail(),
+        detail: detail.clone(),
         action: action_label(&candidate),
-        search_text: name.clone(),
+        search_text: format!("{name} {detail}"),
         name,
         value: candidate,
     }
@@ -338,6 +393,7 @@ fn action_label(candidate: &Candidate) -> String {
 
 #[cfg(test)]
 mod tests {
+    use crossterm::event::KeyModifiers;
     use insta::assert_snapshot;
     use ratatui::Terminal;
     use ratatui::backend::TestBackend;

@@ -1,4 +1,4 @@
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, HashMap};
 use std::path::PathBuf;
 
 use anyhow::Result;
@@ -107,13 +107,17 @@ pub fn merge_candidates(
     remote_branches: Vec<(String, String, String)>,
 ) -> Vec<Candidate> {
     let mut candidates = BTreeMap::<String, Candidate>::new();
+    let mut remote_name_counts = HashMap::<String, usize>::new();
+    for (name, _, _) in &remote_branches {
+        *remote_name_counts.entry(name.clone()).or_default() += 1;
+    }
 
     for worktree in worktrees.into_iter().filter(|worktree| !worktree.is_main) {
         let Some(branch) = worktree.branch else {
             continue;
         };
         let candidate = candidates
-            .entry(branch.clone())
+            .entry(local_candidate_key(&branch))
             .or_insert_with(|| Candidate::new(branch));
         candidate.worktree_path = Some(worktree.path);
         candidate.worktree_head = worktree.head;
@@ -121,7 +125,7 @@ pub fn merge_candidates(
 
     for (branch, upstream, head) in local_branches {
         let candidate = candidates
-            .entry(branch.clone())
+            .entry(local_candidate_key(&branch))
             .or_insert_with(|| Candidate::new(branch.clone()));
         candidate.local_ref = Some(branch);
         candidate.upstream = upstream;
@@ -129,12 +133,46 @@ pub fn merge_candidates(
     }
 
     for (name, remote_ref, head) in remote_branches {
+        if let Some(candidate) = candidates.get_mut(&local_candidate_key(&name))
+            && should_attach_remote_to_local_candidate(
+                candidate,
+                &remote_ref,
+                remote_name_counts
+                    .get(name.as_str())
+                    .copied()
+                    .unwrap_or_default(),
+            )
+        {
+            candidate.remote_ref = Some(remote_ref);
+            candidate.remote_head = Some(head);
+            continue;
+        }
+
         let candidate = candidates
-            .entry(name.clone())
+            .entry(remote_candidate_key(&remote_ref))
             .or_insert_with(|| Candidate::new(name));
         candidate.remote_ref = Some(remote_ref);
         candidate.remote_head = Some(head);
     }
 
     candidates.into_values().collect()
+}
+
+fn local_candidate_key(branch: &str) -> String {
+    format!("local:{branch}")
+}
+
+fn remote_candidate_key(remote_ref: &str) -> String {
+    format!("remote:{remote_ref}")
+}
+
+fn should_attach_remote_to_local_candidate(
+    candidate: &Candidate,
+    remote_ref: &str,
+    remote_name_count: usize,
+) -> bool {
+    candidate.upstream.as_deref() == Some(remote_ref)
+        || (candidate.upstream.is_none()
+            && candidate.remote_ref.is_none()
+            && remote_name_count <= 1)
 }

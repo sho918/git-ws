@@ -40,7 +40,7 @@ awk -v version="$version" '
 ' Cargo.toml > "$tmp"
 mv "$tmp" Cargo.toml
 
-cargo check --offline
+cargo check
 
 printf 'updated package version to %s\n' "$version"
 printf 'release tag: v%s\n' "$version"

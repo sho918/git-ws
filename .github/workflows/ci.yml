@@ -50,7 +50,7 @@ jobs:
         run: cargo +"$RUST_VERSION" fmt --check
 
       - name: Lint
-        run: cargo +"$RUST_VERSION" clippy --all-targets -- -D warnings
+        run: cargo +"$RUST_VERSION" clippy --all-targets --locked -- -D warnings
 
       - name: Test
         run: cargo +"$RUST_VERSION" test --locked

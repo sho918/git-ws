@@ -7,7 +7,8 @@ use anyhow::{Result, anyhow};
 use git_ws::candidates::{Candidate, CandidateFilter, load_candidates};
 use git_ws::cleanup::{CleanupOptions, run_cleanup};
 use git_ws::git::{
-    current_branch, default_local_branch, emit_cd_path, git_status, switch_target_exists,
+    branch_exists, current_branch, default_branch, emit_cd_path, git_status, local_branch_name,
+    remote_tracking_ref_for_branch, remote_tracking_refname,
 };
 use git_ws::github::{
     create_issue_worktree, create_pr_worktree, issue_picker_entries, list_open_issues,
@@ -45,10 +46,13 @@ fn run() -> Result<()> {
     }
     if program.ends_with("git-main") {
         let target = match args.first().and_then(|arg| arg.to_str()) {
-            Some("master") => MainTarget::Master,
+            Some("master") => {
+                args.remove(0);
+                MainTarget::Master
+            }
             _ => MainTarget::Default,
         };
-        return cmd_main(target);
+        return cmd_main_args(target, args);
     }
 
     let Some(command) = args
@@ -72,8 +76,8 @@ fn run() -> Result<()> {
         "issue" => cmd_issue(rest),
         "pr" => cmd_pr(rest),
         "cleanup" => cmd_cleanup(rest),
-        "main" => cmd_main(MainTarget::Default),
-        "master" => cmd_main(MainTarget::Master),
+        "main" => cmd_main_args(MainTarget::Default, rest),
+        "master" => cmd_main_args(MainTarget::Master, rest),
         "init-shell" => cmd_init_shell(rest),
         "doctor" => cmd_doctor(),
         other => {
@@ -89,6 +93,13 @@ fn run() -> Result<()> {
 enum MainTarget {
     Default,
     Master,
+}
+
+fn cmd_main_args(target: MainTarget, args: Vec<OsString>) -> Result<()> {
+    if let Some(arg) = args.first() {
+        return Err(anyhow!("unexpected argument: {}", arg.to_string_lossy()));
+    }
+    cmd_main(target)
 }
 
 fn cmd_open(args: Vec<OsString>) -> Result<()> {
@@ -152,7 +163,7 @@ fn cmd_pr(args: Vec<OsString>) -> Result<()> {
     } else {
         return Ok(());
     };
-    create_pr_worktree(&id, pr.branch, pr.run_init)
+    create_pr_worktree(&id, pr.branch, pr.run_init, pr.force)
 }
 
 fn pick_issue_id() -> Result<Option<String>> {
@@ -191,19 +202,37 @@ fn cmd_cleanup(args: Vec<OsString>) -> Result<()> {
 }
 
 fn cmd_main(target: MainTarget) -> Result<()> {
-    let branch = match target {
+    let target_ref = match target {
         MainTarget::Master => "master".to_string(),
-        MainTarget::Default => default_local_branch(),
+        MainTarget::Default => default_branch().ok_or_else(|| {
+            anyhow!("default branch could not be determined; set remote HEAD or use main/master")
+        })?,
     };
-    if let Some(path) = find_worktree_for_branch(&branch)? {
+    let branch = local_branch_name(&target_ref);
+    let remote_ref = remote_tracking_refname(&target_ref).or_else(|| {
+        (target == MainTarget::Master)
+            .then(|| remote_tracking_ref_for_branch(branch))
+            .flatten()
+    });
+    if let Some(path) = find_worktree_for_branch(branch)? {
         emit_cd_path(&path)?;
         return Ok(());
     }
-    if current_branch().ok().as_deref() != Some(branch.as_str()) && switch_target_exists(&branch) {
-        git_status(["switch", branch.as_str()])?;
+    if current_branch().ok().as_deref() == Some(branch) {
+        emit_cd_path(&std::env::current_dir()?)?;
+        return Ok(());
     }
-    emit_cd_path(&std::env::current_dir()?)?;
-    Ok(())
+    if branch_exists(branch) {
+        git_status(["switch", branch])?;
+        emit_cd_path(&std::env::current_dir()?)?;
+        return Ok(());
+    }
+    if let Some(remote_ref) = remote_ref {
+        git_status(["switch", "-c", branch, "--track", remote_ref.as_str()])?;
+        emit_cd_path(&std::env::current_dir()?)?;
+        return Ok(());
+    }
+    Err(anyhow!("branch not found: {branch}"))
 }
 
 fn cmd_init_shell(args: Vec<OsString>) -> Result<()> {
@@ -270,12 +299,21 @@ fn run_candidate(candidate: Candidate) -> Result<()> {
         return Ok(());
     }
     if let Some(remote) = candidate.remote_ref {
+        if let Some(path) = find_worktree_for_branch(&candidate.name)? {
+            emit_cd_path(&path)?;
+            return Ok(());
+        }
+        if branch_exists(&candidate.name) {
+            git_status(["switch", candidate.name.as_str()])?;
+            return Ok(());
+        }
+        let remote_ref = remote_tracking_refname(&remote).unwrap_or(remote);
         git_status([
             "switch",
             "-c",
             candidate.name.as_str(),
             "--track",
-            remote.as_str(),
+            remote_ref.as_str(),
         ])?;
         return Ok(());
     }
@@ -401,6 +439,7 @@ struct PrArgs {
     id: Option<String>,
     branch: Option<String>,
     run_init: bool,
+    force: bool,
 }
 
 fn parse_pr_args(args: Vec<OsString>) -> Result<PrArgs> {
@@ -408,10 +447,12 @@ fn parse_pr_args(args: Vec<OsString>) -> Result<PrArgs> {
     let mut id = None;
     let mut branch = None;
     let mut run_init = true;
+    let mut force = false;
     while let Some(arg) = parser.next()? {
         match arg {
             Long("branch") => branch = Some(parser.value()?.string()?),
             Long("no-init") => run_init = false,
+            Long("force") => force = true,
             Value(value) if id.is_none() => id = Some(value.string()?),
             _ => return Err(arg.unexpected().into()),
         }
@@ -420,6 +461,7 @@ fn parse_pr_args(args: Vec<OsString>) -> Result<PrArgs> {
         id,
         branch,
         run_init,
+        force,
     })
 }
 
@@ -452,7 +494,7 @@ Usage:
   git ws list [--json] [--type all|worktree|local|remote]
   git ws new <branch> [--from <ref>] [--path <path>] [--no-init]
   git ws issue [number|url] [--base <ref>] [--branch <name>] [--no-init]
-  git ws pr [number|url] [--branch <name>] [--no-init]
+  git ws pr [number|url] [--branch <name>] [--no-init] [--force]
   git ws cleanup [--dry-run] [--yes] [--force] [--json]
   git ws main
   git ws init-shell fish|zsh|bash

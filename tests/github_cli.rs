@@ -1,11 +1,15 @@
 mod support;
 
+use std::collections::BTreeMap;
 use std::fs;
 use std::os::unix::fs::PermissionsExt;
 use std::path::Path;
+use std::process::Command;
 
+use serde::Serialize;
 use support::{
     TestRepo, assert_success, command_output_with_path, configure_git_user, git, last_stdout_line,
+    prepend_path,
 };
 
 #[test]
@@ -74,6 +78,61 @@ exit 1
 }
 
 #[test]
+fn same_repo_pr_sets_upstream_when_creating_local_branch() {
+    let repo = TestRepo::with_remote();
+    repo.create_remote_branch("feature/pr-head");
+    git(repo.path(), ["branch", "-D", "feature/pr-head"]);
+    let fake_bin = fake_gh(
+        r#"
+if [ "$1" = "pr" ]; then
+  printf '{"number":7,"title":"Add PR worktree","headRefName":"feature/pr-head","isCrossRepository":false}'
+  exit 0
+fi
+exit 1
+"#,
+    );
+
+    let output = command_output_with_path(repo.path(), fake_bin.path(), ["pr", "7", "--no-init"]);
+
+    assert_success(&output);
+    let path = last_stdout_line(&output);
+    let upstream = git(
+        Path::new(&path),
+        ["rev-parse", "--abbrev-ref", "--symbolic-full-name", "@{u}"],
+    );
+    assert_eq!(
+        String::from_utf8_lossy(&upstream.stdout).trim(),
+        "origin/feature/pr-head"
+    );
+}
+
+#[test]
+fn pr_view_does_not_request_unsupported_base_repository_field() {
+    let repo = TestRepo::with_remote();
+    repo.create_remote_branch("feature/pr-head");
+    let fake_bin = fake_gh(
+        r#"
+case "$*" in
+  *baseRepository*)
+    printf 'Unknown JSON field: "baseRepository"' >&2
+    exit 2
+    ;;
+esac
+
+if [ "$1" = "pr" ]; then
+  printf '{"number":7,"title":"Add PR worktree","headRefName":"feature/pr-head","isCrossRepository":false}'
+  exit 0
+fi
+exit 1
+"#,
+    );
+
+    let output = command_output_with_path(repo.path(), fake_bin.path(), ["pr", "7", "--no-init"]);
+
+    assert_success(&output);
+}
+
+#[test]
 fn same_repo_pr_fetches_updated_head_before_creating_worktree() {
     let repo = TestRepo::with_remote();
     repo.create_remote_branch("feature/pr-head");
@@ -119,6 +178,328 @@ exit 1
     assert_eq!(
         String::from_utf8_lossy(&worktree_head.stdout).trim(),
         remote_head
+    );
+}
+
+#[test]
+fn same_repo_pr_fetches_head_branch_when_tag_has_same_name() {
+    let repo = TestRepo::with_remote();
+    repo.create_remote_branch("feature/pr-head");
+    let branch_head = git(
+        repo.remote_path(),
+        ["rev-parse", "refs/heads/feature/pr-head"],
+    );
+    let branch_head = String::from_utf8_lossy(&branch_head.stdout)
+        .trim()
+        .to_string();
+    git(
+        repo.remote_path(),
+        ["update-ref", "refs/tags/feature/pr-head", "refs/heads/main"],
+    );
+    git(repo.path(), ["branch", "-D", "feature/pr-head"]);
+    let fake_bin = fake_gh(
+        r#"
+if [ "$1" = "pr" ]; then
+  printf '{"number":7,"title":"Add PR worktree","headRefName":"feature/pr-head","isCrossRepository":false}'
+  exit 0
+fi
+exit 1
+"#,
+    );
+
+    let output = command_output_with_path(repo.path(), fake_bin.path(), ["pr", "7", "--no-init"]);
+
+    assert_success(&output);
+    let path = last_stdout_line(&output);
+    let worktree_head = git(Path::new(&path), ["rev-parse", "HEAD"]);
+    assert_eq!(
+        String::from_utf8_lossy(&worktree_head.stdout).trim(),
+        branch_head
+    );
+}
+
+#[test]
+fn same_repo_pr_fetches_from_only_non_origin_remote() {
+    let repo = TestRepo::new();
+    let upstream = tempfile::tempdir().expect("upstream remote");
+    git(upstream.path(), ["init", "--bare", "-b", "main"]);
+    git(
+        repo.path(),
+        [
+            "remote",
+            "add",
+            "upstream",
+            upstream.path().to_str().expect("upstream path"),
+        ],
+    );
+    git(repo.path(), ["push", "-u", "upstream", "main"]);
+    git(repo.path(), ["switch", "-c", "feature/pr-head"]);
+    fs::write(repo.path().join("upstream-pr-head.txt"), "upstream\n")
+        .expect("write upstream PR head");
+    git(repo.path(), ["add", "upstream-pr-head.txt"]);
+    git(repo.path(), ["commit", "-m", "upstream pr head"]);
+    git(repo.path(), ["push", "-u", "upstream", "feature/pr-head"]);
+    let remote_head = git(upstream.path(), ["rev-parse", "refs/heads/feature/pr-head"]);
+    let remote_head = String::from_utf8_lossy(&remote_head.stdout)
+        .trim()
+        .to_string();
+    git(repo.path(), ["switch", "main"]);
+    git(repo.path(), ["branch", "-D", "feature/pr-head"]);
+    let fake_bin = fake_gh(
+        r#"
+if [ "$1" = "pr" ]; then
+  printf '{"number":7,"title":"Add PR worktree","headRefName":"feature/pr-head","isCrossRepository":false}'
+  exit 0
+fi
+exit 1
+"#,
+    );
+
+    let output = command_output_with_path(repo.path(), fake_bin.path(), ["pr", "7", "--no-init"]);
+
+    assert_success(&output);
+    let path = last_stdout_line(&output);
+    let worktree_head = git(Path::new(&path), ["rev-parse", "HEAD"]);
+    assert_eq!(
+        String::from_utf8_lossy(&worktree_head.stdout).trim(),
+        remote_head
+    );
+}
+
+#[test]
+fn same_repo_pr_fetches_from_remote_matching_current_github_repo() {
+    let repo = TestRepo::new();
+    let remotes = tempfile::tempdir().expect("remotes");
+    let fork = remotes.path().join("fork-owner").join("repo.git");
+    let upstream = remotes.path().join("owner").join("repo.git");
+    fs::create_dir_all(&fork).expect("create fork remote");
+    fs::create_dir_all(&upstream).expect("create upstream remote");
+    git(&fork, ["init", "--bare", "-b", "main"]);
+    git(&upstream, ["init", "--bare", "-b", "main"]);
+    let fork_url = format!("file://{}", fork.display());
+    let upstream_url = format!("file://{}", upstream.display());
+    git(repo.path(), ["remote", "add", "origin", &fork_url]);
+    git(repo.path(), ["remote", "add", "upstream", &upstream_url]);
+    git(repo.path(), ["push", "-u", "upstream", "main"]);
+    git(repo.path(), ["switch", "-c", "feature/pr-head"]);
+    fs::write(repo.path().join("upstream-pr-head.txt"), "upstream\n")
+        .expect("write upstream PR head");
+    git(repo.path(), ["add", "upstream-pr-head.txt"]);
+    git(repo.path(), ["commit", "-m", "upstream pr head"]);
+    git(repo.path(), ["push", "-u", "upstream", "feature/pr-head"]);
+    let remote_head = git(&upstream, ["rev-parse", "refs/heads/feature/pr-head"]);
+    let remote_head = String::from_utf8_lossy(&remote_head.stdout)
+        .trim()
+        .to_string();
+    git(repo.path(), ["switch", "main"]);
+    git(repo.path(), ["branch", "-D", "feature/pr-head"]);
+    let fake_bin = fake_gh(
+        r#"
+case "$*" in
+  *baseRepository*)
+    printf 'Unknown JSON field: "baseRepository"' >&2
+    exit 2
+    ;;
+esac
+
+if [ "$1" = "pr" ]; then
+  printf '{"number":7,"title":"Add PR worktree","headRefName":"feature/pr-head","isCrossRepository":false}'
+  exit 0
+fi
+if [ "$1" = "repo" ]; then
+  printf '{"nameWithOwner":"owner/repo"}'
+  exit 0
+fi
+exit 1
+"#,
+    );
+
+    let output = command_output_with_path(repo.path(), fake_bin.path(), ["pr", "7", "--no-init"]);
+
+    assert_success(&output);
+    let path = last_stdout_line(&output);
+    let worktree_head = git(Path::new(&path), ["rev-parse", "HEAD"]);
+    assert_eq!(
+        String::from_utf8_lossy(&worktree_head.stdout).trim(),
+        remote_head
+    );
+}
+
+#[test]
+fn fork_pr_url_fetches_pull_ref_from_base_repository_remote() {
+    let repo = TestRepo::new();
+    let remotes = tempfile::tempdir().expect("remotes");
+    let fork = remotes.path().join("fork-owner").join("repo.git");
+    let upstream = remotes.path().join("owner").join("repo.git");
+    fs::create_dir_all(&fork).expect("create fork remote");
+    fs::create_dir_all(&upstream).expect("create upstream remote");
+    git(&fork, ["init", "--bare", "-b", "main"]);
+    git(&upstream, ["init", "--bare", "-b", "main"]);
+    let fork_url = format!("file://{}", fork.display());
+    let upstream_url = format!("file://{}", upstream.display());
+    git(repo.path(), ["remote", "add", "origin", &fork_url]);
+    git(repo.path(), ["remote", "add", "upstream", &upstream_url]);
+    git(repo.path(), ["push", "-u", "origin", "main"]);
+    git(repo.path(), ["push", "upstream", "main"]);
+    git(repo.path(), ["switch", "-c", "pull-source-7"]);
+    fs::write(repo.path().join("upstream-pull-ref.txt"), "upstream\n")
+        .expect("write upstream PR head");
+    git(repo.path(), ["add", "upstream-pull-ref.txt"]);
+    git(repo.path(), ["commit", "-m", "upstream pull ref"]);
+    git(repo.path(), ["push", "upstream", "HEAD:pull-source-7"]);
+    git(
+        &upstream,
+        ["update-ref", "refs/pull/7/head", "refs/heads/pull-source-7"],
+    );
+    let pull_head = git(&upstream, ["rev-parse", "refs/pull/7/head"]);
+    let pull_head = String::from_utf8_lossy(&pull_head.stdout)
+        .trim()
+        .to_string();
+    git(repo.path(), ["switch", "main"]);
+    git(repo.path(), ["branch", "-D", "pull-source-7"]);
+    let fake_bin = fake_gh(
+        r#"
+if [ "$1" = "pr" ]; then
+  printf '{"number":7,"title":"External Contribution","headRefName":"contributor-branch","isCrossRepository":true}'
+  exit 0
+fi
+if [ "$1" = "repo" ]; then
+  printf '{"nameWithOwner":"fork-owner/repo"}'
+  exit 0
+fi
+exit 1
+"#,
+    );
+
+    let output = command_output_with_path(
+        repo.path(),
+        fake_bin.path(),
+        ["pr", "https://github.com/owner/repo/pull/7", "--no-init"],
+    );
+
+    assert_success(&output);
+    let path = last_stdout_line(&output);
+    let worktree_head = git(Path::new(&path), ["rev-parse", "HEAD"]);
+    assert_eq!(
+        String::from_utf8_lossy(&worktree_head.stdout).trim(),
+        pull_head
+    );
+}
+
+#[test]
+fn same_repo_pr_force_updates_local_head_when_worktree_is_absent() {
+    let repo = TestRepo::with_remote();
+    repo.create_remote_branch("feature/pr-head");
+    let clone_parent = tempfile::tempdir().expect("clone parent");
+    let clone_path = clone_parent.path().join("clone");
+    git(
+        clone_parent.path(),
+        [
+            "clone",
+            repo.remote_path().to_str().expect("remote path"),
+            clone_path.to_str().expect("clone path"),
+        ],
+    );
+    configure_git_user(&clone_path);
+    git(&clone_path, ["switch", "-c", "rewritten", "origin/main"]);
+    fs::write(clone_path.join("rewritten-pr-head.txt"), "rewritten\n")
+        .expect("write rewritten PR head");
+    git(&clone_path, ["add", "rewritten-pr-head.txt"]);
+    git(&clone_path, ["commit", "-m", "rewritten pr head"]);
+    git(
+        &clone_path,
+        ["push", "--force", "origin", "HEAD:feature/pr-head"],
+    );
+    let remote_head = git(
+        repo.remote_path(),
+        ["rev-parse", "refs/heads/feature/pr-head"],
+    );
+    let remote_head = String::from_utf8_lossy(&remote_head.stdout)
+        .trim()
+        .to_string();
+
+    let fake_bin = fake_gh(
+        r#"
+if [ "$1" = "pr" ]; then
+  printf '{"number":7,"title":"Add PR worktree","headRefName":"feature/pr-head","isCrossRepository":false}'
+  exit 0
+fi
+exit 1
+"#,
+    );
+
+    let output = command_output_with_path(
+        repo.path(),
+        fake_bin.path(),
+        ["pr", "7", "--no-init", "--force"],
+    );
+
+    assert_success(&output);
+    let path = last_stdout_line(&output);
+    let worktree_head = git(Path::new(&path), ["rev-parse", "HEAD"]);
+    assert_eq!(
+        String::from_utf8_lossy(&worktree_head.stdout).trim(),
+        remote_head
+    );
+}
+
+#[test]
+fn same_repo_pr_refuses_non_fast_forward_local_head_without_force() {
+    let repo = TestRepo::with_remote();
+    repo.create_remote_branch("feature/pr-head");
+    git(repo.path(), ["switch", "feature/pr-head"]);
+    fs::write(repo.path().join("local-only-pr-head.txt"), "local\n").expect("write local PR head");
+    git(repo.path(), ["add", "local-only-pr-head.txt"]);
+    git(repo.path(), ["commit", "-m", "local pr head"]);
+    let local_head = git(repo.path(), ["rev-parse", "HEAD"]);
+    let local_head = String::from_utf8_lossy(&local_head.stdout)
+        .trim()
+        .to_string();
+    git(repo.path(), ["switch", "main"]);
+
+    let clone_parent = tempfile::tempdir().expect("clone parent");
+    let clone_path = clone_parent.path().join("clone");
+    git(
+        clone_parent.path(),
+        [
+            "clone",
+            repo.remote_path().to_str().expect("remote path"),
+            clone_path.to_str().expect("clone path"),
+        ],
+    );
+    configure_git_user(&clone_path);
+    git(&clone_path, ["switch", "feature/pr-head"]);
+    fs::write(clone_path.join("remote-only-pr-head.txt"), "remote\n")
+        .expect("write remote PR head");
+    git(&clone_path, ["add", "remote-only-pr-head.txt"]);
+    git(&clone_path, ["commit", "-m", "remote pr head"]);
+    git(&clone_path, ["push", "origin", "feature/pr-head"]);
+
+    let fake_bin = fake_gh(
+        r#"
+if [ "$1" = "pr" ]; then
+  printf '{"number":7,"title":"Add PR worktree","headRefName":"feature/pr-head","isCrossRepository":false}'
+  exit 0
+fi
+exit 1
+"#,
+    );
+
+    let output = command_output_with_path(repo.path(), fake_bin.path(), ["pr", "7", "--no-init"]);
+
+    assert!(
+        !output.status.success(),
+        "non-fast-forward PR fetch should fail without --force"
+    );
+    assert!(
+        String::from_utf8_lossy(&output.stderr).contains("--force"),
+        "failure should explain the explicit overwrite path"
+    );
+    let after = git(repo.path(), ["rev-parse", "feature/pr-head"]);
+    assert_eq!(
+        String::from_utf8_lossy(&after.stdout).trim(),
+        local_head,
+        "local PR branch should keep its unpushed commit"
     );
 }
 
@@ -209,6 +590,49 @@ exit 1
 }
 
 #[test]
+fn fork_pr_does_not_run_trusted_init_commands() {
+    let repo = TestRepo::with_remote();
+    repo.create_pull_ref(13);
+    let marker = repo.path().join("fork-init-ran");
+    let init_command = format!("printf init > '{}'", marker.display());
+    fs::write(
+        repo.path().join(".git-ws.toml"),
+        format!(
+            r#"
+[init]
+on_create = ["{init_command}"]
+"#
+        ),
+    )
+    .expect("write config");
+    let config_home = tempfile::tempdir().expect("config home");
+    write_trusted_init_store(repo.path(), config_home.path(), &[init_command]);
+    let fake_bin = fake_gh(
+        r#"
+if [ "$1" = "pr" ]; then
+  printf '{"number":13,"title":"External Init","headRefName":"fork-branch","isCrossRepository":true}'
+  exit 0
+fi
+exit 1
+"#,
+    );
+
+    let output = Command::new(env!("CARGO_BIN_EXE_git-ws"))
+        .current_dir(repo.path())
+        .env("PATH", prepend_path(fake_bin.path()))
+        .env("XDG_CONFIG_HOME", config_home.path())
+        .args(["pr", "13"])
+        .output()
+        .expect("run git-ws");
+
+    assert_success(&output);
+    assert!(
+        !marker.exists(),
+        "fork PR should not run init commands automatically"
+    );
+}
+
+#[test]
 fn fork_pr_reuses_existing_worktree_before_fetching_pull_ref() {
     let repo = TestRepo::with_remote();
     repo.create_pull_ref(11);
@@ -257,4 +681,42 @@ fn fake_gh(script: &str) -> tempfile::TempDir {
     permissions.set_mode(0o755);
     fs::set_permissions(&path, permissions).expect("chmod fake gh");
     dir
+}
+
+fn write_trusted_init_store(repo_path: &Path, config_home: &Path, init_commands: &[String]) {
+    let trust_dir = config_home.join("git-ws");
+    fs::create_dir_all(&trust_dir).expect("create trust dir");
+    let trust_path = trust_dir.join("trust.toml");
+    let repo_path = repo_path.canonicalize().expect("canonicalize repo path");
+    let mut repos = BTreeMap::new();
+    repos.insert(
+        repo_path.display().to_string(),
+        trusted_init_value(init_commands),
+    );
+    let raw = toml::to_string_pretty(&TestTrustStore { repos }).expect("serialize trust store");
+    fs::write(trust_path, raw).expect("write trust store");
+}
+
+#[derive(Serialize)]
+struct TestTrustStore {
+    repos: BTreeMap<String, String>,
+}
+
+fn trusted_init_value(init_commands: &[String]) -> String {
+    let mut value = String::from("git-ws-init-trust-v1\n");
+    value.push_str("worktree_base_dir:none\n");
+    value.push_str(&format!("init_commands:{}\n", init_commands.len()));
+    for command in init_commands {
+        push_trust_field(&mut value, "init_command", command);
+    }
+    value
+}
+
+fn push_trust_field(output: &mut String, label: &str, value: &str) {
+    output.push_str(label);
+    output.push(':');
+    output.push_str(&value.len().to_string());
+    output.push(':');
+    output.push_str(value);
+    output.push('\n');
 }

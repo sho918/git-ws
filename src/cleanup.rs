@@ -1,11 +1,11 @@
 use std::collections::{HashMap, HashSet};
+use std::ffi::OsStr;
 use std::io::{self, IsTerminal, Write};
 use std::path::{Path, PathBuf};
-use std::process::Command;
 use std::thread;
 
 use anyhow::{Context, Result, anyhow};
-use crossterm::event::{self, Event, KeyCode, KeyModifiers};
+use crossterm::event::{self, Event, KeyCode};
 use ratatui::Frame;
 use ratatui::layout::{Constraint, Direction, Layout};
 use ratatui::style::{Color, Style};
@@ -13,10 +13,13 @@ use ratatui::text::{Line, Span};
 use ratatui::widgets::{Cell, Paragraph, Row, Table, TableState};
 use serde::Serialize;
 
-use crate::git::{current_worktree_root, default_branch, git_output, git_status, list_worktrees};
+use crate::git::{
+    current_worktree_root, default_branch, git_output, git_output_bytes, git_status,
+    list_worktrees, list_worktrees_with_prunable, local_branch_name, prune_worktrees,
+};
 use crate::path_to_str;
 use crate::tui::{
-    self, HIGHLIGHT_SYMBOL, Outcome, TuiTerminal, header_style, label_line, panel,
+    self, HIGHLIGHT_SYMBOL, NavCommand, Outcome, TuiTerminal, header_style, label_line, panel,
     row_highlight_style,
 };
 
@@ -25,6 +28,7 @@ pub struct CleanupInput {
     pub branch: String,
     pub worktree_path: Option<PathBuf>,
     pub is_current_worktree: bool,
+    pub is_main_worktree: bool,
     pub is_dirty: bool,
     pub upstream_gone: bool,
     pub merged_to_default: bool,
@@ -34,6 +38,7 @@ pub struct CleanupInput {
 pub enum CleanupDisposition {
     SafeDelete,
     SkipCurrent,
+    SkipMain,
     SkipDirty,
     SkipUnmerged,
 }
@@ -42,10 +47,13 @@ pub fn classify_cleanup_candidate(input: &CleanupInput) -> CleanupDisposition {
     if input.is_current_worktree {
         return CleanupDisposition::SkipCurrent;
     }
+    if input.is_main_worktree {
+        return CleanupDisposition::SkipMain;
+    }
     if input.is_dirty {
         return CleanupDisposition::SkipDirty;
     }
-    if input.upstream_gone || input.merged_to_default {
+    if input.merged_to_default {
         CleanupDisposition::SafeDelete
     } else {
         CleanupDisposition::SkipUnmerged
@@ -90,10 +98,21 @@ pub fn run_cleanup(options: CleanupOptions) -> Result<()> {
         prompt_cleanup_selection(&safe)?
     };
 
-    for index in selected {
-        delete_cleanup_candidate(safe[index], options.force)?;
-    }
+    delete_cleanup_candidates_with(&safe, &selected, options.force, delete_cleanup_candidate)
+}
 
+fn delete_cleanup_candidates_with<F>(
+    safe: &[&CleanupInput],
+    selected: &[usize],
+    force: bool,
+    mut delete: F,
+) -> Result<()>
+where
+    F: FnMut(&CleanupInput, bool) -> Result<()>,
+{
+    for &index in selected {
+        delete(safe[index], force)?;
+    }
     Ok(())
 }
 
@@ -101,8 +120,9 @@ fn should_cleanup_candidate(input: &CleanupInput, force: bool) -> bool {
     match classify_cleanup_candidate(input) {
         CleanupDisposition::SafeDelete => true,
         CleanupDisposition::SkipCurrent => false,
+        CleanupDisposition::SkipMain => false,
         CleanupDisposition::SkipDirty => force && is_stale_or_merged(input),
-        CleanupDisposition::SkipUnmerged => false,
+        CleanupDisposition::SkipUnmerged => force && input.upstream_gone,
     }
 }
 
@@ -111,43 +131,59 @@ fn is_stale_or_merged(input: &CleanupInput) -> bool {
 }
 
 pub fn discover_cleanup_candidates() -> Result<Vec<CleanupInput>> {
-    let (current_root, worktrees, local) = thread::scope(|scope| -> Result<_> {
+    let (current_root, worktrees_pair, local, default) = thread::scope(|scope| -> Result<_> {
         let current_root = scope.spawn(current_worktree_root);
-        let worktrees = scope.spawn(list_worktrees);
+        let worktrees = scope.spawn(list_worktrees_with_prunable);
         let local = scope.spawn(local_branches_with_track);
+        let default = scope.spawn(default_branch);
         Ok((
             current_root.join().expect("current_worktree_root thread")?,
             worktrees.join().expect("list_worktrees thread")?,
             local.join().expect("local_branches_with_track thread")?,
+            default.join().expect("default_branch thread"),
         ))
     })?;
+    let (worktrees_initial, prunable_seen) = worktrees_pair;
+    let worktrees = if prunable_seen {
+        prune_worktrees()?;
+        list_worktrees()?
+    } else {
+        worktrees_initial
+    };
 
     if local.is_empty() {
         return Ok(Vec::new());
     }
 
-    let default = default_branch().ok_or_else(|| {
-        anyhow!("default branch could not be determined; set origin/HEAD or use main/master")
+    let default = default.ok_or_else(|| {
+        anyhow!("default branch could not be determined; set remote HEAD or use main/master")
     })?;
-    let default_local = default
-        .strip_prefix("origin/")
-        .unwrap_or(&default)
-        .to_string();
-    let protected = protected_branches_for_default(&default_local);
-    let merged = merged_branches(&default)?;
-    let merged: HashSet<String> = merged.into_iter().collect();
+    let default_local = local_branch_name(&default);
+    let protected = protected_branches_for_default(default_local);
 
-    let dirty_paths = check_worktrees_dirty(&worktrees);
+    let (merged, dirty_paths) = thread::scope(|scope| {
+        let merged = scope.spawn(|| merged_branches(&default));
+        let dirty = scope.spawn(|| check_worktrees_dirty(&worktrees));
+        (
+            merged.join().expect("merged_branches thread"),
+            dirty.join().expect("check_worktrees_dirty thread"),
+        )
+    });
+    let merged: HashSet<String> = merged?.into_iter().collect();
+
+    let worktree_by_branch: HashMap<&str, &crate::git::Worktree> = worktrees
+        .iter()
+        .filter_map(|worktree| worktree.branch.as_deref().map(|branch| (branch, worktree)))
+        .collect();
 
     Ok(local
         .into_iter()
         .filter(|(branch, _upstream_gone)| !protected.contains(branch))
         .map(|(branch, upstream_gone)| {
-            let worktree_path = worktrees
-                .iter()
-                .find(|worktree| worktree.branch.as_deref() == Some(branch.as_str()))
-                .map(|worktree| worktree.path.clone());
+            let branch_worktree = worktree_by_branch.get(branch.as_str()).copied();
+            let worktree_path = branch_worktree.map(|worktree| worktree.path.clone());
             let is_current_worktree = worktree_path.as_ref() == Some(&current_root);
+            let is_main_worktree = branch_worktree.is_some_and(|worktree| worktree.is_main);
             let is_dirty = worktree_path
                 .as_ref()
                 .is_some_and(|path| dirty_paths.get(path).copied().unwrap_or(false));
@@ -157,6 +193,7 @@ pub fn discover_cleanup_candidates() -> Result<Vec<CleanupInput>> {
                 branch,
                 worktree_path,
                 is_current_worktree,
+                is_main_worktree,
                 is_dirty,
             }
         })
@@ -189,25 +226,32 @@ fn check_worktrees_dirty(worktrees: &[crate::git::Worktree]) -> HashMap<PathBuf,
 fn local_branches_with_track() -> Result<Vec<(String, bool)>> {
     Ok(git_output([
         "for-each-ref",
-        "--format=%(refname:short)%09%(upstream:track)",
+        "--format=%(refname)%09%(upstream:track)",
         "refs/heads",
     ])?
     .lines()
     .filter_map(|line| {
         let (branch, track) = line.split_once('\t')?;
+        let branch = branch.strip_prefix("refs/heads/")?;
         Some((branch.to_string(), track.contains("[gone]")))
     })
     .collect())
 }
 
 fn merged_branches(default: &str) -> Result<Vec<String>> {
-    let output = match git_output(["branch", "--format=%(refname:short)", "--merged", default]) {
+    let merged = format!("--merged={default}");
+    let output = match git_output([
+        "for-each-ref",
+        "--format=%(refname)",
+        merged.as_str(),
+        "refs/heads",
+    ]) {
         Ok(output) => output,
         Err(_) => return Ok(Vec::new()),
     };
     Ok(output
         .lines()
-        .map(|line| line.trim_start_matches('*').trim().to_string())
+        .filter_map(|line| line.strip_prefix("refs/heads/").map(str::to_string))
         .filter(|branch| !branch.is_empty())
         .collect())
 }
@@ -220,13 +264,15 @@ fn protected_branches_for_default(default_local: &str) -> HashSet<String> {
 }
 
 fn worktree_clean(path: &Path) -> Result<bool> {
-    let output = Command::new("git")
-        .arg("-C")
-        .arg(path)
-        .args(["status", "--porcelain", "--untracked-files=normal"])
-        .output()
-        .with_context(|| format!("failed to inspect {}", path.display()))?;
-    Ok(output.status.success() && output.stdout.is_empty())
+    let bytes = git_output_bytes([
+        OsStr::new("-C"),
+        path.as_os_str(),
+        OsStr::new("status"),
+        OsStr::new("--porcelain"),
+        OsStr::new("--untracked-files=normal"),
+    ])
+    .with_context(|| format!("failed to inspect {}", path.display()))?;
+    Ok(bytes.is_empty())
 }
 
 fn print_cleanup_candidates(inputs: &[&CleanupInput]) {
@@ -319,7 +365,9 @@ fn run_cleanup_selector(inputs: &[&CleanupInput]) -> Result<Vec<usize>> {
     let mut state = CleanupSelectorState::new(inputs);
 
     loop {
-        terminal.draw(|frame| render_cleanup_selector(frame, &state))?;
+        if !event::poll(std::time::Duration::ZERO).unwrap_or(false) {
+            terminal.draw(|frame| render_cleanup_selector(frame, &state))?;
+        }
         loop {
             match event::read()? {
                 Event::Key(key) => {
@@ -354,29 +402,31 @@ struct CleanupSelectorState {
     selected: usize,
     checked: Vec<bool>,
     rows: Vec<CleanupRow>,
-    selected_count: usize,
 }
 
 impl CleanupSelectorState {
     fn new(inputs: &[&CleanupInput]) -> Self {
-        let rows = inputs
+        let rows: Vec<CleanupRow> = inputs
             .iter()
             .map(|input| CleanupRow {
                 branch: input.branch.clone(),
                 reason: cleanup_reason(input),
                 path: cleanup_path(input),
             })
-            .collect::<Vec<_>>();
+            .collect();
         Self {
             selected: 0,
             checked: vec![false; rows.len()],
             rows,
-            selected_count: 0,
         }
     }
 
     fn len(&self) -> usize {
         self.rows.len()
+    }
+
+    fn selected_count(&self) -> usize {
+        self.checked.iter().filter(|&&value| value).count()
     }
 
     fn apply(&mut self, command: CleanupCommand) -> Outcome {
@@ -395,21 +445,15 @@ impl CleanupSelectorState {
             }
             CleanupCommand::Toggle => {
                 if let Some(value) = self.checked.get_mut(self.selected) {
-                    if *value {
-                        self.selected_count -= 1;
-                    } else {
-                        self.selected_count += 1;
-                    }
                     *value = !*value;
                 }
                 Outcome::Continue
             }
             CleanupCommand::ToggleAll => {
-                let all_checked = self.selected_count == self.checked.len();
+                let all_checked = self.checked.iter().all(|&value| value);
                 for value in &mut self.checked {
                     *value = !all_checked;
                 }
-                self.selected_count = if all_checked { 0 } else { self.checked.len() };
                 Outcome::Continue
             }
             CleanupCommand::Ignore => Outcome::Continue,
@@ -437,16 +481,15 @@ enum CleanupCommand {
 }
 
 fn cleanup_command(key: event::KeyEvent) -> CleanupCommand {
+    if let Some(nav) = tui::nav_command(key) {
+        return match nav {
+            NavCommand::Up => CleanupCommand::Up,
+            NavCommand::Down => CleanupCommand::Down,
+            NavCommand::Submit => CleanupCommand::Submit,
+            NavCommand::Cancel => CleanupCommand::Cancel,
+        };
+    }
     match key.code {
-        KeyCode::Char('c') if key.modifiers.contains(KeyModifiers::CONTROL) => {
-            CleanupCommand::Cancel
-        }
-        KeyCode::Char('n') if key.modifiers.contains(KeyModifiers::CONTROL) => CleanupCommand::Down,
-        KeyCode::Char('p') if key.modifiers.contains(KeyModifiers::CONTROL) => CleanupCommand::Up,
-        KeyCode::Esc => CleanupCommand::Cancel,
-        KeyCode::Enter => CleanupCommand::Submit,
-        KeyCode::Up => CleanupCommand::Up,
-        KeyCode::Down => CleanupCommand::Down,
         KeyCode::Char(' ') => CleanupCommand::Toggle,
         KeyCode::Char('a' | 'A') => CleanupCommand::ToggleAll,
         _ => CleanupCommand::Ignore,
@@ -470,7 +513,7 @@ fn render_cleanup_selector(frame: &mut Frame<'_>, state: &CleanupSelectorState) 
         Span::raw(format!(
             "  {} candidate(s), {} selected",
             state.len(),
-            state.selected_count
+            state.selected_count()
         )),
     ]);
     frame.render_widget(Paragraph::new(title).block(panel(" cleanup ")), chunks[0]);
@@ -532,9 +575,9 @@ fn render_cleanup_selector(frame: &mut Frame<'_>, state: &CleanupSelectorState) 
 }
 
 fn delete_cleanup_candidate(input: &CleanupInput, force: bool) -> Result<()> {
-    if input.worktree_path.is_some() && !force && !input.merged_to_default {
+    if !force && !input.merged_to_default {
         return Err(anyhow!(
-            "refusing to remove worktree for unmerged branch without --force: {}",
+            "refusing to delete unmerged branch without --force: {}",
             input.branch
         ));
     }
@@ -546,14 +589,9 @@ fn delete_cleanup_candidate(input: &CleanupInput, force: bool) -> Result<()> {
         args.push(path_to_str(path)?);
         git_status(args)?;
     }
-    // Use -D for merged-to-default branches: `git branch -d` re-checks against HEAD,
-    // not the default ref we already validated against.
-    let flag = if force || input.merged_to_default {
-        "-D"
-    } else {
-        "-d"
-    };
-    git_status(["branch", flag, input.branch.as_str()])
+    // `git branch -d` re-checks against HEAD, so use -D only after the
+    // default-merge or force validation above.
+    git_status(["branch", "-D", input.branch.as_str()])
 }
 
 #[derive(Serialize)]
@@ -568,6 +606,8 @@ struct CleanupRecord<'a> {
     merged_to_default: bool,
     dirty: bool,
     current: bool,
+    #[serde(rename = "mainWorktree")]
+    main_worktree: bool,
 }
 
 fn print_cleanup_json(inputs: &[CleanupInput]) -> Result<()> {
@@ -581,6 +621,7 @@ fn print_cleanup_json(inputs: &[CleanupInput]) -> Result<()> {
             merged_to_default: input.merged_to_default,
             dirty: input.is_dirty,
             current: input.is_current_worktree,
+            main_worktree: input.is_main_worktree,
         })
         .collect();
     println!("{}", serde_json::to_string_pretty(&values)?);
@@ -589,6 +630,7 @@ fn print_cleanup_json(inputs: &[CleanupInput]) -> Result<()> {
 
 #[cfg(test)]
 mod tests {
+    use crossterm::event::KeyModifiers;
     use insta::assert_snapshot;
     use ratatui::Terminal;
     use ratatui::backend::TestBackend;
@@ -606,7 +648,7 @@ mod tests {
         assert_eq!(state.apply(CleanupCommand::ToggleAll), Outcome::Continue);
 
         assert_eq!(state.selected, 1);
-        assert_eq!(state.selected_count, 3);
+        assert_eq!(state.selected_count(), 3);
         assert_eq!(state.selected_indices(), vec![0, 1, 2]);
     }
 
@@ -629,12 +671,29 @@ mod tests {
     }
 
     #[test]
+    fn cleanup_deletes_selected_candidates_in_selection_order() {
+        let inputs = sample_inputs(3);
+        let input_refs: Vec<_> = inputs.iter().collect();
+        let mut deleted = Vec::new();
+
+        delete_cleanup_candidates_with(&input_refs, &[2, 0], false, |input, force| {
+            assert!(!force);
+            deleted.push(input.branch.clone());
+            Ok(())
+        })
+        .expect("delete selected cleanup candidates");
+
+        assert_eq!(deleted, ["branch-2", "branch-0"]);
+    }
+
+    #[test]
     fn renders_cleanup_selector_snapshot() {
         let inputs = [
             CleanupInput {
                 branch: "feature/default-merged".to_string(),
                 worktree_path: Some(PathBuf::from("/repo/.worktrees/default-merged")),
                 is_current_worktree: false,
+                is_main_worktree: false,
                 is_dirty: false,
                 upstream_gone: false,
                 merged_to_default: true,
@@ -643,6 +702,7 @@ mod tests {
                 branch: "feature/gone".to_string(),
                 worktree_path: None,
                 is_current_worktree: false,
+                is_main_worktree: false,
                 is_dirty: false,
                 upstream_gone: true,
                 merged_to_default: false,
@@ -666,6 +726,7 @@ mod tests {
                 branch: format!("branch-{index}"),
                 worktree_path: None,
                 is_current_worktree: false,
+                is_main_worktree: false,
                 is_dirty: false,
                 upstream_gone: true,
                 merged_to_default: false,

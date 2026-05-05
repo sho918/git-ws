@@ -3,6 +3,7 @@ use std::sync::Once;
 
 use anyhow::Result;
 use crossterm::cursor;
+use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 use crossterm::execute;
 use crossterm::terminal::{
     EnterAlternateScreen, LeaveAlternateScreen, disable_raw_mode, enable_raw_mode,
@@ -20,6 +21,32 @@ pub(crate) enum Outcome {
     Continue,
     Submit,
     Cancel,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum NavCommand {
+    Up,
+    Down,
+    Submit,
+    Cancel,
+}
+
+pub(crate) fn nav_command(key: KeyEvent) -> Option<NavCommand> {
+    if key.modifiers.contains(KeyModifiers::CONTROL) {
+        return match key.code {
+            KeyCode::Char('c') => Some(NavCommand::Cancel),
+            KeyCode::Char('n') => Some(NavCommand::Down),
+            KeyCode::Char('p') => Some(NavCommand::Up),
+            _ => None,
+        };
+    }
+    match key.code {
+        KeyCode::Esc => Some(NavCommand::Cancel),
+        KeyCode::Enter => Some(NavCommand::Submit),
+        KeyCode::Up => Some(NavCommand::Up),
+        KeyCode::Down => Some(NavCommand::Down),
+        _ => None,
+    }
 }
 
 pub(crate) fn is_interactive() -> bool {

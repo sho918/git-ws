@@ -5,11 +5,12 @@ use std::process::Command;
 use anyhow::{Context, Result, anyhow};
 
 use crate::config::{
-    FileConfig, ensure_init_trusted, load_file_config, load_git_config, resolve_base_dir,
+    FileConfig, ensure_base_dir_ignored, ensure_init_trusted, load_file_config, load_git_config,
+    resolve_base_dir,
 };
 use crate::git::{
-    branch_exists, default_start_point, emit_cd_path, ensure_repo, git_status, list_worktrees,
-    primary_worktree_root,
+    Worktree, branch_exists, default_start_point, emit_cd_path, ensure_repo, git_status,
+    list_worktrees_after_prune_if_stale, primary_worktree_root,
 };
 use crate::path_to_str;
 
@@ -26,16 +27,31 @@ pub struct CreateWorktreeOptions {
 }
 
 pub fn create_worktree(options: CreateWorktreeOptions) -> Result<PathBuf> {
-    if let Some(path) = find_worktree_for_branch(&options.branch)? {
+    let worktrees = list_worktrees_after_prune_if_stale()?;
+    if let Some(path) = worktree_path_for_existing_branch(&worktrees, &options.branch) {
         emit_cd_path(&path)?;
         return Ok(path);
     }
+    create_worktree_unchecked(options, &worktrees)
+}
 
+/// Create a new worktree without first checking whether the branch already
+/// has one. The caller must have invoked `prune_worktrees` and pass a fresh
+/// `worktrees` snapshot — stale entries cause `git worktree add` to fail and
+/// the primary path used for trust/anchor decisions is read from this slice.
+pub(crate) fn create_worktree_unchecked(
+    options: CreateWorktreeOptions,
+    worktrees: &[Worktree],
+) -> Result<PathBuf> {
     let repo = ensure_repo()?;
     let file_config = load_file_config(&repo.root)?;
     let git_config = load_git_config();
-    let base_anchor = primary_worktree_root()?;
+    let base_anchor = worktrees
+        .first()
+        .map(|worktree| worktree.path.clone())
+        .unwrap_or_else(|| repo.root.clone());
     let base_dir = resolve_base_dir(&base_anchor, &file_config, &git_config);
+    let uses_generated_path = options.path.is_none();
     let path = match options.path {
         Some(path) => path,
         None => worktree_path_for_branch(&base_dir, &options.branch)?,
@@ -43,7 +59,10 @@ pub fn create_worktree(options: CreateWorktreeOptions) -> Result<PathBuf> {
 
     let should_run_init = should_run_init(options.run_init, &file_config);
     if should_run_init {
-        ensure_init_trusted(&repo.root, &file_config)?;
+        ensure_init_trusted(&base_anchor, &file_config)?;
+    }
+    if uses_generated_path {
+        ensure_base_dir_ignored(&base_anchor, &base_dir)?;
     }
 
     if let Some(parent) = path.parent() {
@@ -87,16 +106,25 @@ pub fn ensure_worktree_init_trusted(run_init: bool) -> Result<()> {
     let repo = ensure_repo()?;
     let file_config = load_file_config(&repo.root)?;
     if should_run_init(run_init, &file_config) {
-        ensure_init_trusted(&repo.root, &file_config)?;
+        let primary = primary_worktree_root()?;
+        ensure_init_trusted(&primary, &file_config)?;
     }
     Ok(())
 }
 
 pub fn find_worktree_for_branch(branch: &str) -> Result<Option<PathBuf>> {
-    Ok(list_worktrees()?
-        .into_iter()
+    let worktrees = list_worktrees_after_prune_if_stale()?;
+    Ok(worktree_path_for_existing_branch(&worktrees, branch))
+}
+
+pub(crate) fn worktree_path_for_existing_branch(
+    worktrees: &[Worktree],
+    branch: &str,
+) -> Option<PathBuf> {
+    worktrees
+        .iter()
         .find(|worktree| worktree.branch.as_deref() == Some(branch))
-        .map(|worktree| worktree.path))
+        .map(|worktree| worktree.path.clone())
 }
 
 fn should_run_init(run_init: bool, file_config: &FileConfig) -> bool {

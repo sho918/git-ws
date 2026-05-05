@@ -7,7 +7,7 @@ use git_ws::git::{Worktree, parse_worktree_porcelain};
 use git_ws::github::{
     IssueListItem, PullRequestListItem, issue_picker_entries, pr_picker_entries, slugify_title,
 };
-use git_ws::picker::{PickerEntry, rank_entries};
+use git_ws::picker::{PickerEntry, pick_candidate, rank_entries};
 use git_ws::shell::init_script;
 use git_ws::worktree::path_segment_for_branch;
 
@@ -15,8 +15,10 @@ use git_ws::worktree::path_segment_for_branch;
 fn parses_nul_terminated_worktree_porcelain() {
     let input = b"worktree /repo\0HEAD aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\0branch refs/heads/main\0\0worktree /repo/.worktrees/feature\0HEAD bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb\0branch refs/heads/feature/demo\0\0";
 
-    let worktrees = parse_worktree_porcelain(input).expect("porcelain should parse");
+    let (worktrees, prunable_seen) =
+        parse_worktree_porcelain(input).expect("porcelain should parse");
 
+    assert!(!prunable_seen);
     assert_eq!(
         worktrees,
         vec![
@@ -40,14 +42,35 @@ fn parses_nul_terminated_worktree_porcelain() {
 fn parses_detached_worktree_without_branch() {
     let input = b"worktree /repo\0HEAD aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\0detached\0\0";
 
-    let worktrees = parse_worktree_porcelain(input).expect("porcelain should parse");
+    let (worktrees, prunable_seen) =
+        parse_worktree_porcelain(input).expect("porcelain should parse");
 
+    assert!(!prunable_seen);
     assert_eq!(
         worktrees,
         vec![Worktree {
             path: PathBuf::from("/repo"),
             head: Some("aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa".to_string()),
             branch: None,
+            is_main: true,
+        }]
+    );
+}
+
+#[test]
+fn skips_prunable_worktree_porcelain_entries() {
+    let input = b"worktree /repo\0HEAD aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\0branch refs/heads/main\0\0worktree /repo/.worktrees/missing\0HEAD bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb\0branch refs/heads/feature/missing\0prunable gitdir file points to non-existent location\0\0";
+
+    let (worktrees, prunable_seen) =
+        parse_worktree_porcelain(input).expect("porcelain should parse");
+
+    assert!(prunable_seen);
+    assert_eq!(
+        worktrees,
+        vec![Worktree {
+            path: PathBuf::from("/repo"),
+            head: Some("aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa".to_string()),
+            branch: Some("main".to_string()),
             is_main: true,
         }]
     );
@@ -96,6 +119,34 @@ fn merges_worktree_local_and_remote_candidates_by_branch_name() {
             local_head: Some("abc1234".to_string()),
             remote_head: Some("abc1234".to_string()),
         }]
+    );
+}
+
+#[test]
+fn preserves_remote_candidates_with_same_branch_name() {
+    let candidates = merge_candidates(
+        vec![],
+        vec![],
+        vec![
+            (
+                "feature/shared".to_string(),
+                "origin/feature/shared".to_string(),
+                "abc1234".to_string(),
+            ),
+            (
+                "feature/shared".to_string(),
+                "upstream/feature/shared".to_string(),
+                "def5678".to_string(),
+            ),
+        ],
+    );
+
+    assert_eq!(
+        candidates
+            .iter()
+            .filter_map(|candidate| candidate.remote_ref.as_deref())
+            .collect::<Vec<_>>(),
+        vec!["origin/feature/shared", "upstream/feature/shared"]
     );
 }
 
@@ -168,6 +219,110 @@ fn fuzzy_ranking_returns_matching_entries_only() {
         ranked.iter().map(|entry| entry.value).collect::<Vec<_>>(),
         vec!["feature/worktree-cleanup"]
     );
+}
+
+#[test]
+fn picker_query_without_match_returns_error() {
+    let entries = vec![PickerEntry {
+        value: "feature/worktree-cleanup",
+        marker: String::new(),
+        name: "feature/worktree-cleanup".to_string(),
+        detail: String::new(),
+        action: String::new(),
+        search_text: "feature/worktree-cleanup".to_string(),
+    }];
+
+    let error = git_ws::picker::pick_entry(
+        &entries,
+        Some("missing-branch"),
+        git_ws::picker::PickerView {
+            prompt: "git ws>",
+            marker_header: "Avail",
+            name_header: "Name",
+            detail_header: "Detail",
+        },
+    )
+    .unwrap_err();
+
+    assert!(
+        error.to_string().contains("no match for query"),
+        "unexpected error: {error:#}"
+    );
+}
+
+#[test]
+fn candidate_query_with_duplicate_remote_branch_is_ambiguous() {
+    let candidates = vec![
+        Candidate {
+            name: "feature/shared".to_string(),
+            worktree_path: None,
+            local_ref: None,
+            remote_ref: Some("origin/feature/shared".to_string()),
+            upstream: None,
+            worktree_head: None,
+            local_head: None,
+            remote_head: Some("abc1234".to_string()),
+        },
+        Candidate {
+            name: "feature/shared".to_string(),
+            worktree_path: None,
+            local_ref: None,
+            remote_ref: Some("upstream/feature/shared".to_string()),
+            upstream: None,
+            worktree_head: None,
+            local_head: None,
+            remote_head: Some("def5678".to_string()),
+        },
+    ];
+
+    let error = pick_candidate(&candidates, Some("feature/shared")).unwrap_err();
+
+    assert!(
+        error.to_string().contains("ambiguous remote branch query"),
+        "unexpected error: {error:#}"
+    );
+}
+
+#[test]
+fn candidate_query_prefers_local_match_over_duplicate_remote_ambiguity() {
+    let candidates = vec![
+        Candidate {
+            name: "feature/shared".to_string(),
+            worktree_path: None,
+            local_ref: Some("feature/shared".to_string()),
+            remote_ref: None,
+            upstream: None,
+            worktree_head: None,
+            local_head: Some("abc1234".to_string()),
+            remote_head: None,
+        },
+        Candidate {
+            name: "feature/shared".to_string(),
+            worktree_path: None,
+            local_ref: None,
+            remote_ref: Some("origin/feature/shared".to_string()),
+            upstream: None,
+            worktree_head: None,
+            local_head: None,
+            remote_head: Some("def5678".to_string()),
+        },
+        Candidate {
+            name: "feature/shared".to_string(),
+            worktree_path: None,
+            local_ref: None,
+            remote_ref: Some("upstream/feature/shared".to_string()),
+            upstream: None,
+            worktree_head: None,
+            local_head: None,
+            remote_head: Some("fed9876".to_string()),
+        },
+    ];
+
+    let selected = pick_candidate(&candidates, Some("feature/shared"))
+        .expect("local exact match should not be ambiguous")
+        .expect("candidate should be selected");
+
+    assert_eq!(selected.local_ref.as_deref(), Some("feature/shared"));
 }
 
 #[test]
@@ -326,9 +481,23 @@ fn cleanup_keeps_only_safe_default_candidates() {
             branch: "feature/gone".to_string(),
             worktree_path: Some(PathBuf::from("/repo/.worktrees/gone")),
             is_current_worktree: false,
+            is_main_worktree: false,
             is_dirty: false,
             upstream_gone: true,
             merged_to_default: false,
+        }),
+        CleanupDisposition::SkipUnmerged
+    );
+
+    assert_eq!(
+        classify_cleanup_candidate(&CleanupInput {
+            branch: "feature/default-merged".to_string(),
+            worktree_path: None,
+            is_current_worktree: false,
+            is_main_worktree: false,
+            is_dirty: false,
+            upstream_gone: false,
+            merged_to_default: true,
         }),
         CleanupDisposition::SafeDelete
     );
@@ -338,6 +507,7 @@ fn cleanup_keeps_only_safe_default_candidates() {
             branch: "feature/dirty".to_string(),
             worktree_path: Some(PathBuf::from("/repo/.worktrees/dirty")),
             is_current_worktree: false,
+            is_main_worktree: false,
             is_dirty: true,
             upstream_gone: true,
             merged_to_default: true,
@@ -353,11 +523,28 @@ fn cleanup_classification_protects_current_before_dirty() {
             branch: "feature/current".to_string(),
             worktree_path: Some(PathBuf::from("/repo")),
             is_current_worktree: true,
+            is_main_worktree: true,
             is_dirty: true,
             upstream_gone: true,
             merged_to_default: true,
         }),
         CleanupDisposition::SkipCurrent
+    );
+}
+
+#[test]
+fn cleanup_classification_protects_main_worktree() {
+    assert_eq!(
+        classify_cleanup_candidate(&CleanupInput {
+            branch: "feature/main-worktree".to_string(),
+            worktree_path: Some(PathBuf::from("/repo")),
+            is_current_worktree: false,
+            is_main_worktree: true,
+            is_dirty: false,
+            upstream_gone: false,
+            merged_to_default: true,
+        }),
+        CleanupDisposition::SkipMain
     );
 }
 
@@ -368,6 +555,7 @@ fn cleanup_classification_skips_unmerged_branches() {
             branch: "feature/live".to_string(),
             worktree_path: None,
             is_current_worktree: false,
+            is_main_worktree: false,
             is_dirty: false,
             upstream_gone: false,
             merged_to_default: false,
