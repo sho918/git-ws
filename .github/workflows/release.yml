@@ -11,8 +11,7 @@ on:
         required: true
         type: string
 
-permissions:
-  contents: write
+permissions: {}
 
 env:
   RUST_VERSION: "1.95.0"
@@ -21,22 +20,27 @@ jobs:
   verify:
     name: Verify release inputs
     runs-on: ubuntu-latest
+    permissions:
+      contents: read
     outputs:
       version: ${{ steps.version.outputs.version }}
       package_version: ${{ steps.version.outputs.package_version }}
     steps:
       - name: Checkout
-        uses: actions/checkout@v6
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
         with:
           fetch-depth: 0
+          persist-credentials: false
 
       - name: Resolve version
         id: version
         shell: bash
+        env:
+          DISPATCH_VERSION: ${{ inputs.version }}
         run: |
           set -euo pipefail
-          if [ "${{ github.event_name }}" = "workflow_dispatch" ]; then
-            version="${{ inputs.version }}"
+          if [ "$GITHUB_EVENT_NAME" = "workflow_dispatch" ]; then
+            version="$DISPATCH_VERSION"
           else
             version="${GITHUB_REF_NAME}"
           fi
@@ -49,10 +53,11 @@ jobs:
           echo "package_version=${package_version}" >> "$GITHUB_OUTPUT"
 
       - name: Install Rust
-        run: rustup toolchain install "$RUST_VERSION" --profile minimal --component rustfmt clippy
+        run: rustup toolchain install "$RUST_VERSION" --profile minimal --component rustfmt --component clippy
 
-      - name: Cache Cargo
-        uses: actions/cache@v5
+      - name: Restore Cargo cache
+        id: cargo-cache
+        uses: actions/cache/restore@27d5ce7f107fe9357f9df03efb73ab90386fccae # v5.0.5
         with:
           path: |
             ~/.cargo/registry
@@ -72,9 +77,21 @@ jobs:
       - name: Build
         run: cargo +"$RUST_VERSION" build --locked
 
+      - name: Save Cargo cache
+        if: steps.cargo-cache.outputs.cache-hit != 'true'
+        uses: actions/cache/save@27d5ce7f107fe9357f9df03efb73ab90386fccae # v5.0.5
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: ${{ steps.cargo-cache.outputs.cache-primary-key }}
+
   build-artifacts:
     name: Build ${{ matrix.target }}
     needs: verify
+    permissions:
+      contents: read
     strategy:
       fail-fast: false
       matrix:
@@ -88,17 +105,21 @@ jobs:
     runs-on: ${{ matrix.os }}
     steps:
       - name: Checkout
-        uses: actions/checkout@v6
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
         with:
           fetch-depth: 0
+          persist-credentials: false
 
       - name: Install Rust target
+        env:
+          RELEASE_TARGET: ${{ matrix.target }}
         run: |
           rustup toolchain install "$RUST_VERSION" --profile minimal
-          rustup target add --toolchain "$RUST_VERSION" "${{ matrix.target }}"
+          rustup target add --toolchain "$RUST_VERSION" "$RELEASE_TARGET"
 
-      - name: Cache Cargo
-        uses: actions/cache@v5
+      - name: Restore Cargo cache
+        id: cargo-cache
+        uses: actions/cache/restore@27d5ce7f107fe9357f9df03efb73ab90386fccae # v5.0.5
         with:
           path: |
             ~/.cargo/registry
@@ -107,20 +128,34 @@ jobs:
           key: ${{ runner.os }}-${{ matrix.target }}-cargo-${{ hashFiles('Cargo.lock') }}
 
       - name: Build release binary
-        run: cargo +"$RUST_VERSION" build --locked --release --target "${{ matrix.target }}"
+        env:
+          RELEASE_TARGET: ${{ matrix.target }}
+        run: cargo +"$RUST_VERSION" build --locked --release --target "$RELEASE_TARGET"
+
+      - name: Save Cargo cache
+        if: steps.cargo-cache.outputs.cache-hit != 'true'
+        uses: actions/cache/save@27d5ce7f107fe9357f9df03efb73ab90386fccae # v5.0.5
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: ${{ steps.cargo-cache.outputs.cache-primary-key }}
 
       - name: Package artifact
         shell: bash
+        env:
+          RELEASE_TARGET: ${{ matrix.target }}
+          RELEASE_VERSION: ${{ needs.verify.outputs.version }}
         run: |
           set -euo pipefail
-          version="${{ needs.verify.outputs.version }}"
-          package_dir="dist/git-ws-${version}-${{ matrix.target }}"
+          package_dir="dist/git-ws-${RELEASE_VERSION}-${RELEASE_TARGET}"
           mkdir -p "$package_dir"
-          cp "target/${{ matrix.target }}/release/git-ws" "$package_dir/git-ws"
-          tar -C dist -czf "dist/git-ws-${version}-${{ matrix.target }}.tar.gz" "git-ws-${version}-${{ matrix.target }}"
+          cp "target/${RELEASE_TARGET}/release/git-ws" "$package_dir/git-ws"
+          tar -C dist -czf "dist/git-ws-${RELEASE_VERSION}-${RELEASE_TARGET}.tar.gz" "git-ws-${RELEASE_VERSION}-${RELEASE_TARGET}"
 
       - name: Upload workflow artifact
-        uses: actions/upload-artifact@v7
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
           name: git-ws-${{ needs.verify.outputs.version }}-${{ matrix.target }}
           path: dist/*.tar.gz
@@ -131,15 +166,18 @@ jobs:
     needs:
       - verify
       - build-artifacts
+    permissions:
+      contents: write
     runs-on: ubuntu-latest
     steps:
       - name: Checkout
-        uses: actions/checkout@v6
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
         with:
           fetch-depth: 0
+          persist-credentials: false
 
       - name: Download artifacts
-        uses: actions/download-artifact@v7
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
         with:
           path: dist
           pattern: git-ws-${{ needs.verify.outputs.version }}-*
@@ -155,4 +193,5 @@ jobs:
       - name: Create GitHub Release
         env:
           GH_TOKEN: ${{ github.token }}
-        run: gh release create "${{ needs.verify.outputs.version }}" dist/* --generate-notes --verify-tag
+          RELEASE_VERSION: ${{ needs.verify.outputs.version }}
+        run: gh release create "$RELEASE_VERSION" dist/* --generate-notes --verify-tag
