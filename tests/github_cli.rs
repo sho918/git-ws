@@ -2,8 +2,9 @@ mod support;
 
 use std::fs;
 use std::os::unix::fs::PermissionsExt;
+use std::path::Path;
 
-use support::{TestRepo, assert_success, command_output_with_path};
+use support::{TestRepo, assert_success, command_output_with_path, git, last_stdout_line};
 
 #[test]
 fn issue_creates_slugged_worktree_without_network() {
@@ -68,6 +69,57 @@ exit 1
     assert_success(&output);
     let path = String::from_utf8_lossy(&output.stdout).trim().to_string();
     assert!(path.ends_with(".worktrees/feature-pr-head"));
+}
+
+#[test]
+fn same_repo_pr_fetches_updated_head_before_creating_worktree() {
+    let repo = TestRepo::with_remote();
+    repo.create_remote_branch("feature/pr-head");
+    let clone_parent = tempfile::tempdir().expect("clone parent");
+    let clone_path = clone_parent.path().join("clone");
+    git(
+        clone_parent.path(),
+        [
+            "clone",
+            repo.remote_path().to_str().expect("remote path"),
+            clone_path.to_str().expect("clone path"),
+        ],
+    );
+    git(&clone_path, ["config", "user.name", "Test User"]);
+    git(&clone_path, ["config", "user.email", "test@example.com"]);
+    git(&clone_path, ["config", "commit.gpgsign", "false"]);
+    git(&clone_path, ["switch", "feature/pr-head"]);
+    fs::write(clone_path.join("new-pr-head.txt"), "new\n").expect("write new PR head");
+    git(&clone_path, ["add", "new-pr-head.txt"]);
+    git(&clone_path, ["commit", "-m", "new pr head"]);
+    git(&clone_path, ["push", "origin", "feature/pr-head"]);
+    let remote_head = git(
+        repo.remote_path(),
+        ["rev-parse", "refs/heads/feature/pr-head"],
+    );
+    let remote_head = String::from_utf8_lossy(&remote_head.stdout)
+        .trim()
+        .to_string();
+
+    let fake_bin = fake_gh(
+        r#"
+if [ "$1" = "pr" ]; then
+  printf '{"number":7,"title":"Add PR worktree","headRefName":"feature/pr-head","isCrossRepository":false}'
+  exit 0
+fi
+exit 1
+"#,
+    );
+
+    let output = command_output_with_path(repo.path(), fake_bin.path(), ["pr", "7", "--no-init"]);
+
+    assert_success(&output);
+    let path = last_stdout_line(&output);
+    let worktree_head = git(Path::new(&path), ["rev-parse", "HEAD"]);
+    assert_eq!(
+        String::from_utf8_lossy(&worktree_head.stdout).trim(),
+        remote_head
+    );
 }
 
 #[test]

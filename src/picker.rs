@@ -22,26 +22,6 @@ pub struct PickerEntry<T> {
     pub search_text: String,
 }
 
-impl<T> PickerEntry<T> {
-    pub fn new(
-        value: T,
-        marker: String,
-        name: String,
-        detail: String,
-        action: String,
-        search_text: String,
-    ) -> Self {
-        Self {
-            value,
-            marker,
-            name,
-            detail,
-            action,
-            search_text,
-        }
-    }
-}
-
 #[derive(Debug, Clone, Copy)]
 pub struct PickerView<'a> {
     pub prompt: &'a str,
@@ -224,12 +204,15 @@ fn fit(value: &str, width: usize) -> String {
 }
 
 fn candidate_entry(candidate: Candidate) -> PickerEntry<Candidate> {
-    let marker = candidate.availability_label();
     let name = candidate.name.clone();
-    let detail = candidate.detail();
-    let action = action_label(&candidate);
-    let search_text = candidate.name.clone();
-    PickerEntry::new(candidate, marker, name, detail, action, search_text)
+    PickerEntry {
+        marker: candidate.availability_label(),
+        detail: candidate.detail(),
+        action: action_label(&candidate),
+        search_text: name.clone(),
+        name,
+        value: candidate,
+    }
 }
 
 fn action_label(candidate: &Candidate) -> String {

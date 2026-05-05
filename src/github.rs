@@ -3,7 +3,7 @@ use std::process::Command;
 use anyhow::{Context, Result, anyhow};
 use serde::Deserialize;
 
-use crate::git::{git_status, ref_exists};
+use crate::git::git_status;
 use crate::picker::PickerEntry;
 use crate::worktree::{CreateWorktreeOptions, create_worktree, find_worktree_for_branch};
 
@@ -70,11 +70,9 @@ pub fn create_pr_worktree(id: &str, branch: Option<String>, run_init: bool) -> R
     let start_point = if pr.is_cross_repository {
         fetch_into_branch(&format!("refs/pull/{}/head", pr.number), &branch)?;
         None
-    } else if !local_remote_exists(&pr.head_ref_name) {
+    } else {
         fetch_into_branch(&pr.head_ref_name, &branch)?;
         None
-    } else {
-        Some(format!("origin/{}", pr.head_ref_name))
     };
 
     create_worktree(CreateWorktreeOptions {
@@ -112,27 +110,19 @@ pub fn list_open_prs() -> Result<Vec<PullRequestListItem>> {
     ])
 }
 
-pub fn parse_issue_list_json(input: &[u8]) -> Result<Vec<IssueListItem>> {
-    serde_json::from_slice(input).context("failed to parse gh issue list JSON")
-}
-
-pub fn parse_pr_list_json(input: &[u8]) -> Result<Vec<PullRequestListItem>> {
-    serde_json::from_slice(input).context("failed to parse gh PR list JSON")
-}
-
 pub fn issue_picker_entries(issues: &[IssueListItem]) -> Vec<PickerEntry<String>> {
     issues
         .iter()
         .map(|issue| {
             let number = issue.number.to_string();
-            PickerEntry::new(
-                number.clone(),
-                format!("#{number}"),
-                issue.title.clone(),
-                "open issue".to_string(),
-                format!("create worktree for issue #{number}"),
-                format!("#{number} {}", issue.title),
-            )
+            PickerEntry {
+                marker: format!("#{number}"),
+                name: issue.title.clone(),
+                detail: "open issue".to_string(),
+                action: format!("create worktree for issue #{number}"),
+                search_text: format!("#{number} {}", issue.title),
+                value: number,
+            }
         })
         .collect()
 }
@@ -146,14 +136,14 @@ pub fn pr_picker_entries(prs: &[PullRequestListItem]) -> Vec<PickerEntry<String>
             } else {
                 pr.head_ref_name.clone()
             };
-            PickerEntry::new(
-                number.clone(),
-                format!("#{number}"),
-                pr.title.clone(),
+            PickerEntry {
+                marker: format!("#{number}"),
+                name: pr.title.clone(),
                 detail,
-                format!("create worktree for PR #{number}"),
-                format!("#{number} {} {}", pr.title, pr.head_ref_name),
-            )
+                action: format!("create worktree for PR #{number}"),
+                search_text: format!("#{number} {} {}", pr.title, pr.head_ref_name),
+                value: number,
+            }
         })
         .collect()
 }
@@ -179,10 +169,6 @@ fn gh_json<const N: usize, T: for<'de> Deserialize<'de>>(args: [&str; N]) -> Res
         ));
     }
     serde_json::from_slice(&output.stdout).context("failed to parse gh JSON")
-}
-
-fn local_remote_exists(branch: &str) -> bool {
-    ref_exists(&format!("refs/remotes/origin/{branch}"))
 }
 
 fn fetch_into_branch(refspec: &str, branch: &str) -> Result<()> {

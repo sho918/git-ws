@@ -1,9 +1,7 @@
-use std::collections::{BTreeMap, HashMap};
+use std::collections::BTreeMap;
 use std::path::PathBuf;
 
 use anyhow::Result;
-use nucleo_matcher::pattern::{AtomKind, CaseMatching, Normalization, Pattern};
-use nucleo_matcher::{Config, Matcher};
 use serde::Serialize;
 
 use crate::git::{Worktree, list_local_branches, list_remote_branches, list_worktrees};
@@ -139,51 +137,4 @@ pub fn merge_candidates(
     }
 
     candidates.into_values().collect()
-}
-
-pub struct CandidateIndex<'a> {
-    candidates: &'a [Candidate],
-    names: Vec<&'a str>,
-    by_name: HashMap<&'a str, &'a Candidate>,
-    matcher: Matcher,
-}
-
-impl<'a> CandidateIndex<'a> {
-    pub fn new(candidates: &'a [Candidate]) -> Self {
-        let names: Vec<&str> = candidates
-            .iter()
-            .map(|candidate| candidate.name.as_str())
-            .collect();
-        let by_name: HashMap<&str, &Candidate> = candidates
-            .iter()
-            .map(|candidate| (candidate.name.as_str(), candidate))
-            .collect();
-        Self {
-            candidates,
-            names,
-            by_name,
-            matcher: Matcher::new(Config::DEFAULT.match_paths()),
-        }
-    }
-
-    pub fn rank(&mut self, query: &str) -> Vec<&'a Candidate> {
-        if query.trim().is_empty() {
-            return self.candidates.iter().collect();
-        }
-        let pattern = Pattern::new(
-            query,
-            CaseMatching::Smart,
-            Normalization::Smart,
-            AtomKind::Fuzzy,
-        );
-        pattern
-            .match_list(self.names.iter().copied(), &mut self.matcher)
-            .into_iter()
-            .filter_map(|(name, _score)| self.by_name.get(name).copied())
-            .collect()
-    }
-}
-
-pub fn rank_candidates<'a>(query: &str, candidates: &'a [Candidate]) -> Vec<&'a Candidate> {
-    CandidateIndex::new(candidates).rank(query)
 }

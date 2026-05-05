@@ -1,12 +1,11 @@
 use std::path::PathBuf;
 
-use git_ws::candidates::{Candidate, CandidateFilter, merge_candidates, rank_candidates};
+use git_ws::candidates::{Candidate, CandidateFilter, merge_candidates};
 use git_ws::cleanup::{CleanupDisposition, CleanupInput, classify_cleanup_candidate};
 use git_ws::config::{FileConfig, GitConfig, load_file_config, resolve_base_dir};
 use git_ws::git::{Worktree, parse_worktree_porcelain};
 use git_ws::github::{
-    IssueListItem, PullRequestListItem, issue_picker_entries, parse_issue_list_json,
-    parse_pr_list_json, pr_picker_entries, slugify_title,
+    IssueListItem, PullRequestListItem, issue_picker_entries, pr_picker_entries, slugify_title,
 };
 use git_ws::picker::{PickerEntry, rank_entries};
 use git_ws::shell::init_script;
@@ -146,20 +145,27 @@ fn candidate_display_prefers_worktree_then_upstream_then_remote() {
 }
 
 #[test]
-fn fuzzy_ranking_returns_matching_candidates_only() {
-    let candidates = vec![
-        candidate_named("feature/worktree-cleanup"),
-        candidate_named("bug/auth-redirect"),
-        candidate_named("docs/release"),
-    ];
+fn fuzzy_ranking_returns_matching_entries_only() {
+    let entries: Vec<PickerEntry<&'static str>> = [
+        "feature/worktree-cleanup",
+        "bug/auth-redirect",
+        "docs/release",
+    ]
+    .iter()
+    .map(|name| PickerEntry {
+        value: *name,
+        marker: String::new(),
+        name: name.to_string(),
+        detail: String::new(),
+        action: String::new(),
+        search_text: name.to_string(),
+    })
+    .collect();
 
-    let ranked = rank_candidates("cleanup", &candidates);
+    let ranked = rank_entries("cleanup", &entries);
 
     assert_eq!(
-        ranked
-            .iter()
-            .map(|candidate| candidate.name.as_str())
-            .collect::<Vec<_>>(),
+        ranked.iter().map(|entry| entry.value).collect::<Vec<_>>(),
         vec!["feature/worktree-cleanup"]
     );
 }
@@ -167,22 +173,22 @@ fn fuzzy_ranking_returns_matching_candidates_only() {
 #[test]
 fn picker_entries_match_search_text_beyond_display_name() {
     let entries = vec![
-        PickerEntry::new(
-            "7".to_string(),
-            "#7".to_string(),
-            "Add PR worktree".to_string(),
-            "feature/pr-head".to_string(),
-            "create PR worktree".to_string(),
-            "#7 Add PR worktree feature/pr-head".to_string(),
-        ),
-        PickerEntry::new(
-            "8".to_string(),
-            "#8".to_string(),
-            "Fix cleanup".to_string(),
-            "feature/cleanup".to_string(),
-            "create PR worktree".to_string(),
-            "#8 Fix cleanup feature/cleanup".to_string(),
-        ),
+        PickerEntry {
+            value: "7".to_string(),
+            marker: "#7".to_string(),
+            name: "Add PR worktree".to_string(),
+            detail: "feature/pr-head".to_string(),
+            action: "create PR worktree".to_string(),
+            search_text: "#7 Add PR worktree feature/pr-head".to_string(),
+        },
+        PickerEntry {
+            value: "8".to_string(),
+            marker: "#8".to_string(),
+            name: "Fix cleanup".to_string(),
+            detail: "feature/cleanup".to_string(),
+            action: "create PR worktree".to_string(),
+            search_text: "#8 Fix cleanup feature/cleanup".to_string(),
+        },
     ];
 
     let ranked = rank_entries("pr head", &entries);
@@ -192,8 +198,9 @@ fn picker_entries_match_search_text_beyond_display_name() {
 
 #[test]
 fn parses_github_issue_list_and_builds_picker_entries() {
-    let issues = parse_issue_list_json(br#"[{"number":42,"title":"Fix worktree cleanup"}]"#)
-        .expect("issue list should parse");
+    let issues: Vec<IssueListItem> =
+        serde_json::from_slice(br#"[{"number":42,"title":"Fix worktree cleanup"}]"#)
+            .expect("issue list should parse");
 
     assert_eq!(
         issues,
@@ -211,7 +218,7 @@ fn parses_github_issue_list_and_builds_picker_entries() {
 
 #[test]
 fn parses_github_pr_list_and_builds_picker_entries() {
-    let prs = parse_pr_list_json(
+    let prs: Vec<PullRequestListItem> = serde_json::from_slice(
         br#"[{"number":7,"title":"Add PR worktree","headRefName":"feature/pr-head","isCrossRepository":false}]"#,
     )
     .expect("PR list should parse");
@@ -383,18 +390,5 @@ fn shell_init_uses_side_channel_for_cd_targets() {
         let script = init_script(shell).expect(shell);
         assert!(script.contains("GIT_WS_CD_FILE"), "{shell} missing env var");
         assert!(script.contains("mktemp"), "{shell} missing mktemp");
-    }
-}
-
-fn candidate_named(name: &str) -> Candidate {
-    Candidate {
-        name: name.to_string(),
-        worktree_path: None,
-        local_ref: Some(name.to_string()),
-        remote_ref: None,
-        upstream: None,
-        worktree_head: None,
-        local_head: None,
-        remote_head: None,
     }
 }

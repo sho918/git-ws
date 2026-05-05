@@ -203,6 +203,25 @@ fn cleanup_json_reports_gone_branch() {
 }
 
 #[test]
+fn cleanup_yes_keeps_gone_default_branch() {
+    let repo = TestRepo::with_remote();
+    repo.create_remote_branch("feature/current");
+    git(repo.path(), ["switch", "feature/current"]);
+    git(
+        repo.remote_path(),
+        ["symbolic-ref", "HEAD", "refs/heads/feature/current"],
+    );
+    git(repo.remote_path(), ["branch", "-D", "main"]);
+    git(repo.path(), ["fetch", "--prune", "origin"]);
+
+    let output = command_output(repo.path(), ["cleanup", "--yes"]);
+
+    assert_success(&output);
+    let main_branches = git(repo.path(), ["branch", "--list", "main"]);
+    assert!(String::from_utf8_lossy(&main_branches.stdout).contains("main"));
+}
+
+#[test]
 fn cleanup_yes_does_not_force_delete_unmerged_gone_branch() {
     let repo = TestRepo::with_remote();
     repo.create_remote_branch("feature/unmerged-gone");
@@ -225,6 +244,33 @@ fn cleanup_yes_does_not_force_delete_unmerged_gone_branch() {
     );
     let branches = git(repo.path(), ["branch", "--list", "feature/unmerged-gone"]);
     assert!(String::from_utf8_lossy(&branches.stdout).contains("feature/unmerged-gone"));
+}
+
+#[test]
+fn cleanup_force_yes_removes_dirty_gone_worktree() {
+    let repo = TestRepo::with_remote();
+    repo.create_remote_branch("feature/dirty-gone");
+    let create = command_output(repo.path(), ["new", "feature/dirty-gone", "--no-init"]);
+    assert_success(&create);
+    let path = last_stdout_line(&create);
+    std::fs::write(std::path::Path::new(&path).join("dirty.txt"), "dirty\n")
+        .expect("write dirty worktree file");
+    git(repo.remote_path(), ["branch", "-D", "feature/dirty-gone"]);
+    git(repo.path(), ["fetch", "--prune", "origin"]);
+
+    let output = command_output(repo.path(), ["cleanup", "--force", "--yes"]);
+
+    assert_success(&output);
+    assert!(
+        !std::path::Path::new(&path).exists(),
+        "dirty gone worktree should be removed with --force"
+    );
+    let stale_branches = git(repo.path(), ["branch", "--list", "feature/dirty-gone"]);
+    assert_eq!(
+        String::from_utf8_lossy(&stale_branches.stdout).trim(),
+        "",
+        "feature/dirty-gone should have been deleted"
+    );
 }
 
 #[test]

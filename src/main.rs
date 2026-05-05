@@ -128,11 +128,11 @@ fn cmd_new(args: Vec<OsString>) -> Result<()> {
 
 fn cmd_issue(args: Vec<OsString>) -> Result<()> {
     let issue = parse_issue_args(args)?;
-    let id = match issue.id {
-        Some(id) => Some(id),
-        None => pick_issue_id()?,
-    };
-    let Some(id) = id else {
+    let id = if let Some(id) = issue.id {
+        id
+    } else if let Some(id) = pick_issue_id()? {
+        id
+    } else {
         return Ok(());
     };
     create_issue_worktree(&id, issue.base, issue.branch, issue.run_init)
@@ -140,11 +140,11 @@ fn cmd_issue(args: Vec<OsString>) -> Result<()> {
 
 fn cmd_pr(args: Vec<OsString>) -> Result<()> {
     let pr = parse_pr_args(args)?;
-    let id = match pr.id {
-        Some(id) => Some(id),
-        None => pick_pr_id()?,
-    };
-    let Some(id) = id else {
+    let id = if let Some(id) = pr.id {
+        id
+    } else if let Some(id) = pick_pr_id()? {
+        id
+    } else {
         return Ok(());
     };
     create_pr_worktree(&id, pr.branch, pr.run_init)

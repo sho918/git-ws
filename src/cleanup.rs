@@ -113,11 +113,13 @@ pub fn discover_cleanup_candidates() -> Result<Vec<CleanupInput>> {
         ))
     })?;
     let merged: HashSet<String> = merged.into_iter().collect();
+    let protected = protected_branches();
 
     let dirty_paths = check_worktrees_dirty(&worktrees);
 
     Ok(local
         .into_iter()
+        .filter(|(branch, _upstream_gone)| !protected.contains(branch))
         .map(|(branch, upstream_gone)| {
             let worktree_path = worktrees
                 .iter()
@@ -191,12 +193,25 @@ fn merged_branches() -> Result<Vec<String>> {
         Ok(output) => output,
         Err(_) => return Ok(Vec::new()),
     };
-    let protected: HashSet<&str> = ["main", "master", "develop", default_local.as_str()].into();
+    let protected = protected_branches_for_default(&default_local);
     Ok(output
         .lines()
         .map(|line| line.trim_start_matches('*').trim().to_string())
-        .filter(|branch| !branch.is_empty() && !protected.contains(branch.as_str()))
+        .filter(|branch| !branch.is_empty() && !protected.contains(branch))
         .collect())
+}
+
+fn protected_branches() -> HashSet<String> {
+    let default = default_branch();
+    let default_local = default.strip_prefix("origin/").unwrap_or(&default);
+    protected_branches_for_default(default_local)
+}
+
+fn protected_branches_for_default(default_local: &str) -> HashSet<String> {
+    ["main", "master", "develop", default_local]
+        .into_iter()
+        .map(ToString::to_string)
+        .collect()
 }
 
 fn worktree_clean(path: &Path) -> Result<bool> {
@@ -240,7 +255,12 @@ fn prompt_cleanup_selection(max: usize) -> Result<Vec<usize>> {
 
 fn delete_cleanup_candidate(input: &CleanupInput, force: bool) -> Result<()> {
     if let Some(path) = &input.worktree_path {
-        git_status(["worktree", "remove", path_to_str(path)?])?;
+        let path = path_to_str(path)?;
+        if force {
+            git_status(["worktree", "remove", "--force", path])?;
+        } else {
+            git_status(["worktree", "remove", path])?;
+        }
     }
     let flag = if force { "-D" } else { "-d" };
     git_status(["branch", flag, input.branch.as_str()])
