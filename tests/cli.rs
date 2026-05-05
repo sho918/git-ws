@@ -67,6 +67,33 @@ fn new_creates_worktree_from_requested_ref() {
 }
 
 #[test]
+fn new_falls_back_when_slug_path_collides_with_another_branch() {
+    let repo = TestRepo::with_remote();
+
+    let first = command_output(
+        repo.path(),
+        ["new", "feature/foo-bar", "--from", "HEAD", "--no-init"],
+    );
+    assert_success(&first);
+    let first_path = last_stdout_line(&first);
+
+    let second = command_output(
+        repo.path(),
+        ["new", "feature/foo/bar", "--from", "HEAD", "--no-init"],
+    );
+
+    assert_success(&second);
+    let second_path = last_stdout_line(&second);
+    let second_segment = std::path::Path::new(&second_path)
+        .file_name()
+        .and_then(|name| name.to_str())
+        .expect("worktree path segment");
+    assert_ne!(second_path, first_path);
+    assert!(second_segment.starts_with("feature-foo-bar-"));
+    assert!(std::path::Path::new(&second_path).join(".git").exists());
+}
+
+#[test]
 fn new_without_from_does_not_leak_rev_parse_sha() {
     let repo = TestRepo::with_remote();
 

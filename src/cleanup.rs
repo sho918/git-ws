@@ -8,14 +8,17 @@ use anyhow::{Context, Result, anyhow};
 use crossterm::event::{self, Event, KeyCode, KeyModifiers};
 use ratatui::Frame;
 use ratatui::layout::{Constraint, Direction, Layout};
-use ratatui::style::{Color, Modifier, Style};
+use ratatui::style::{Color, Style};
 use ratatui::text::{Line, Span};
-use ratatui::widgets::{Block, Borders, Cell, Paragraph, Row, Table, TableState};
+use ratatui::widgets::{Cell, Paragraph, Row, Table, TableState};
 use serde::Serialize;
 
 use crate::git::{current_worktree_root, default_branch, git_output, git_status, list_worktrees};
 use crate::path_to_str;
-use crate::tui::TuiTerminal;
+use crate::tui::{
+    self, HIGHLIGHT_SYMBOL, Outcome, TuiTerminal, header_style, label_line, panel,
+    row_highlight_style,
+};
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct CleanupInput {
@@ -278,7 +281,7 @@ fn prompt_cleanup_selection(inputs: &[&CleanupInput]) -> Result<Vec<usize>> {
     if !io::stdin().is_terminal() {
         return Err(anyhow!("cleanup requires --yes in non-interactive mode"));
     }
-    if io::stderr().is_terminal() {
+    if tui::is_interactive() {
         return run_cleanup_selector(inputs);
     }
 
@@ -313,63 +316,103 @@ fn prompt_cleanup_selection_text(max: usize) -> Result<Vec<usize>> {
 
 fn run_cleanup_selector(inputs: &[&CleanupInput]) -> Result<Vec<usize>> {
     let mut terminal = TuiTerminal::new()?;
-    let mut state = CleanupSelectorState::new(inputs.len());
+    let mut state = CleanupSelectorState::new(inputs);
 
     loop {
-        terminal.draw(|frame| render_cleanup_selector(frame, &state, inputs))?;
-        let Event::Key(key) = event::read()? else {
-            continue;
-        };
-        match state.apply(cleanup_command(key), inputs.len()) {
-            CleanupOutcome::Continue => {}
-            CleanupOutcome::Cancel => return Ok(Vec::new()),
-            CleanupOutcome::Submit => return Ok(state.selected_indices()),
+        terminal.draw(|frame| render_cleanup_selector(frame, &state))?;
+        loop {
+            match event::read()? {
+                Event::Key(key) => {
+                    let command = cleanup_command(key);
+                    match state.apply(command) {
+                        Outcome::Continue => {
+                            if matches!(command, CleanupCommand::Ignore) {
+                                continue;
+                            }
+                            break;
+                        }
+                        Outcome::Cancel => return Ok(Vec::new()),
+                        Outcome::Submit => return Ok(state.selected_indices()),
+                    }
+                }
+                Event::Resize(..) => break,
+                _ => {}
+            }
         }
     }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct CleanupRow {
+    branch: String,
+    reason: String,
+    path: String,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct CleanupSelectorState {
     selected: usize,
     checked: Vec<bool>,
+    rows: Vec<CleanupRow>,
+    selected_count: usize,
 }
 
 impl CleanupSelectorState {
-    fn new(len: usize) -> Self {
+    fn new(inputs: &[&CleanupInput]) -> Self {
+        let rows = inputs
+            .iter()
+            .map(|input| CleanupRow {
+                branch: input.branch.clone(),
+                reason: cleanup_reason(input),
+                path: cleanup_path(input),
+            })
+            .collect::<Vec<_>>();
         Self {
             selected: 0,
-            checked: vec![false; len],
+            checked: vec![false; rows.len()],
+            rows,
+            selected_count: 0,
         }
     }
 
-    fn apply(&mut self, command: CleanupCommand, len: usize) -> CleanupOutcome {
+    fn len(&self) -> usize {
+        self.rows.len()
+    }
+
+    fn apply(&mut self, command: CleanupCommand) -> Outcome {
         match command {
-            CleanupCommand::Cancel => CleanupOutcome::Cancel,
-            CleanupCommand::Submit => CleanupOutcome::Submit,
+            CleanupCommand::Cancel => Outcome::Cancel,
+            CleanupCommand::Submit => Outcome::Submit,
             CleanupCommand::Up => {
                 self.selected = self.selected.saturating_sub(1);
-                CleanupOutcome::Continue
+                Outcome::Continue
             }
             CleanupCommand::Down => {
-                if self.selected + 1 < len {
+                if self.selected + 1 < self.len() {
                     self.selected += 1;
                 }
-                CleanupOutcome::Continue
+                Outcome::Continue
             }
             CleanupCommand::Toggle => {
                 if let Some(value) = self.checked.get_mut(self.selected) {
+                    if *value {
+                        self.selected_count -= 1;
+                    } else {
+                        self.selected_count += 1;
+                    }
                     *value = !*value;
                 }
-                CleanupOutcome::Continue
+                Outcome::Continue
             }
             CleanupCommand::ToggleAll => {
-                let all_checked = self.checked.iter().all(|value| *value);
+                let all_checked = self.selected_count == self.checked.len();
                 for value in &mut self.checked {
                     *value = !all_checked;
                 }
-                CleanupOutcome::Continue
+                self.selected_count = if all_checked { 0 } else { self.checked.len() };
+                Outcome::Continue
             }
-            CleanupCommand::Ignore => CleanupOutcome::Continue,
+            CleanupCommand::Ignore => Outcome::Continue,
         }
     }
 
@@ -393,13 +436,6 @@ enum CleanupCommand {
     Ignore,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum CleanupOutcome {
-    Continue,
-    Submit,
-    Cancel,
-}
-
 fn cleanup_command(key: event::KeyEvent) -> CleanupCommand {
     match key.code {
         KeyCode::Char('c') if key.modifiers.contains(KeyModifiers::CONTROL) => {
@@ -417,13 +453,8 @@ fn cleanup_command(key: event::KeyEvent) -> CleanupCommand {
     }
 }
 
-fn render_cleanup_selector(
-    frame: &mut Frame<'_>,
-    state: &CleanupSelectorState,
-    inputs: &[&CleanupInput],
-) {
+fn render_cleanup_selector(frame: &mut Frame<'_>, state: &CleanupSelectorState) {
     let area = frame.area();
-    let selected_count = state.checked.iter().filter(|checked| **checked).count();
     let chunks = Layout::default()
         .direction(Direction::Vertical)
         .constraints([
@@ -438,19 +469,11 @@ fn render_cleanup_selector(
         Span::styled("git ws cleanup", Style::default().fg(Color::Cyan)),
         Span::raw(format!(
             "  {} candidate(s), {} selected",
-            inputs.len(),
-            selected_count
+            state.len(),
+            state.selected_count
         )),
     ]);
-    frame.render_widget(
-        Paragraph::new(title).block(
-            Block::default()
-                .borders(Borders::ALL)
-                .border_style(Style::default().fg(Color::DarkGray))
-                .title(" cleanup "),
-        ),
-        chunks[0],
-    );
+    frame.render_widget(Paragraph::new(title).block(panel(" cleanup ")), chunks[0]);
 
     let header = Row::new([
         Cell::from("Del"),
@@ -458,18 +481,18 @@ fn render_cleanup_selector(
         Cell::from("Reason"),
         Cell::from("Path"),
     ])
-    .style(
-        Style::default()
-            .fg(Color::DarkGray)
-            .add_modifier(Modifier::BOLD),
-    );
-    let rows = inputs.iter().enumerate().map(|(index, input)| {
-        let checkbox = if state.checked[index] { "[x]" } else { "[ ]" };
+    .style(header_style());
+    let rows = state.rows.iter().enumerate().map(|(index, row)| {
+        let checkbox = if state.checked.get(index).copied().unwrap_or(false) {
+            "[x]"
+        } else {
+            "[ ]"
+        };
         Row::new([
             Cell::from(checkbox),
-            Cell::from(input.branch.clone()),
-            Cell::from(cleanup_reason(input)),
-            Cell::from(cleanup_path(input)),
+            Cell::from(row.branch.as_str()),
+            Cell::from(row.reason.as_str()),
+            Cell::from(row.path.as_str()),
         ])
     });
     let table = Table::new(
@@ -482,47 +505,24 @@ fn render_cleanup_selector(
         ],
     )
     .header(header)
-    .block(
-        Block::default()
-            .borders(Borders::ALL)
-            .border_style(Style::default().fg(Color::DarkGray))
-            .title(" candidates "),
-    )
-    .row_highlight_style(
-        Style::default()
-            .fg(Color::Black)
-            .bg(Color::Cyan)
-            .add_modifier(Modifier::BOLD),
-    )
-    .highlight_symbol("› ");
+    .block(panel(" candidates "))
+    .row_highlight_style(row_highlight_style())
+    .highlight_symbol(HIGHLIGHT_SYMBOL);
     let mut table_state = TableState::default();
     table_state.select(Some(state.selected));
     frame.render_stateful_widget(table, chunks[1], &mut table_state);
 
-    let detail = inputs
+    let detail = state
+        .rows
         .get(state.selected)
-        .map(|input| {
+        .map(|row| {
             vec![
-                Line::from(vec![
-                    Span::styled("Branch  ", Style::default().fg(Color::DarkGray)),
-                    Span::raw(input.branch.as_str()),
-                ]),
-                Line::from(vec![
-                    Span::styled("Reason  ", Style::default().fg(Color::DarkGray)),
-                    Span::raw(cleanup_reason(input)),
-                ]),
+                label_line("Branch  ", row.branch.as_str()),
+                label_line("Reason  ", row.reason.as_str()),
             ]
         })
         .unwrap_or_else(|| vec![Line::from("No candidate")]);
-    frame.render_widget(
-        Paragraph::new(detail).block(
-            Block::default()
-                .borders(Borders::ALL)
-                .border_style(Style::default().fg(Color::DarkGray))
-                .title(" detail "),
-        ),
-        chunks[2],
-    );
+    frame.render_widget(Paragraph::new(detail).block(panel(" detail ")), chunks[2]);
 
     frame.render_widget(
         Paragraph::new("space toggle  a all  ↑/↓ ctrl+n/p move  enter delete  esc cancel")
@@ -546,8 +546,8 @@ fn delete_cleanup_candidate(input: &CleanupInput, force: bool) -> Result<()> {
         args.push(path_to_str(path)?);
         git_status(args)?;
     }
-    // `git branch -d` falls back to HEAD when no upstream is set.
-    // Candidates merged to default were already checked against that default ref.
+    // Use -D for merged-to-default branches: `git branch -d` re-checks against HEAD,
+    // not the default ref we already validated against.
     let flag = if force || input.merged_to_default {
         "-D"
     } else {
@@ -597,22 +597,16 @@ mod tests {
 
     #[test]
     fn cleanup_selector_toggles_one_and_all_candidates() {
-        let mut state = CleanupSelectorState::new(3);
+        let inputs = sample_inputs(3);
+        let input_refs: Vec<_> = inputs.iter().collect();
+        let mut state = CleanupSelectorState::new(&input_refs);
 
-        assert_eq!(
-            state.apply(CleanupCommand::Toggle, 3),
-            CleanupOutcome::Continue
-        );
-        assert_eq!(
-            state.apply(CleanupCommand::Down, 3),
-            CleanupOutcome::Continue
-        );
-        assert_eq!(
-            state.apply(CleanupCommand::ToggleAll, 3),
-            CleanupOutcome::Continue
-        );
+        assert_eq!(state.apply(CleanupCommand::Toggle), Outcome::Continue);
+        assert_eq!(state.apply(CleanupCommand::Down), Outcome::Continue);
+        assert_eq!(state.apply(CleanupCommand::ToggleAll), Outcome::Continue);
 
         assert_eq!(state.selected, 1);
+        assert_eq!(state.selected_count, 3);
         assert_eq!(state.selected_indices(), vec![0, 1, 2]);
     }
 
@@ -655,14 +649,27 @@ mod tests {
             },
         ];
         let input_refs: Vec<_> = inputs.iter().collect();
-        let mut state = CleanupSelectorState::new(input_refs.len());
-        state.apply(CleanupCommand::Toggle, input_refs.len());
+        let mut state = CleanupSelectorState::new(&input_refs);
+        state.apply(CleanupCommand::Toggle);
         let mut terminal = Terminal::new(TestBackend::new(96, 18)).expect("terminal");
 
         terminal
-            .draw(|frame| render_cleanup_selector(frame, &state, &input_refs))
+            .draw(|frame| render_cleanup_selector(frame, &state))
             .expect("draw");
 
         assert_snapshot!(terminal.backend());
+    }
+
+    fn sample_inputs(count: usize) -> Vec<CleanupInput> {
+        (0..count)
+            .map(|index| CleanupInput {
+                branch: format!("branch-{index}"),
+                worktree_path: None,
+                is_current_worktree: false,
+                is_dirty: false,
+                upstream_gone: true,
+                merged_to_default: false,
+            })
+            .collect()
     }
 }

@@ -1,5 +1,3 @@
-use std::io::{self, IsTerminal};
-
 use anyhow::{Result, anyhow};
 use crossterm::event::{self, Event, KeyCode, KeyModifiers};
 use nucleo_matcher::pattern::{AtomKind, CaseMatching, Normalization, Pattern};
@@ -8,10 +6,13 @@ use ratatui::Frame;
 use ratatui::layout::{Constraint, Direction, Layout};
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
-use ratatui::widgets::{Block, Borders, Cell, Paragraph, Row, Table, TableState, Wrap};
+use ratatui::widgets::{Cell, Paragraph, Row, Table, TableState, Wrap};
 
 use crate::candidates::Candidate;
-use crate::tui::TuiTerminal;
+use crate::tui::{
+    self, HIGHLIGHT_SYMBOL, Outcome, TuiTerminal, header_style, label_line, panel,
+    row_highlight_style,
+};
 
 const VISIBLE_ROWS: usize = 15;
 
@@ -66,7 +67,7 @@ pub fn pick_entry<T: Clone>(
             .map(|entry| entry.value.clone()));
     }
 
-    if !io::stdin().is_terminal() || !io::stderr().is_terminal() {
+    if !tui::is_interactive() {
         return Err(anyhow!(
             "interactive picker requires a terminal or query argument"
         ));
@@ -110,20 +111,37 @@ pub fn rank_entries<'a, T>(query: &str, entries: &'a [PickerEntry<T>]) -> Vec<&'
 fn run_picker<T: Clone>(entries: &[PickerEntry<T>], view: PickerView<'_>) -> Result<Option<T>> {
     let mut terminal = TuiTerminal::new()?;
     let mut state = PickerState::default();
+    let mut ranked = rank_entries(&state.query, entries);
 
     loop {
-        let ranked = rank_entries(&state.query, entries);
         state.clamp_selection(ranked.len());
         terminal.draw(|frame| render_picker(frame, &state, &ranked, view))?;
 
-        let Event::Key(key) = event::read()? else {
-            continue;
-        };
-        match state.apply(picker_command(key), ranked.len()) {
-            PickerOutcome::Continue => {}
-            PickerOutcome::Cancel => return Ok(None),
-            PickerOutcome::Submit => {
-                return Ok(ranked.get(state.selected).map(|entry| entry.value.clone()));
+        loop {
+            match event::read()? {
+                Event::Key(key) => {
+                    let command = picker_command(key);
+                    match state.apply(command, ranked.len()) {
+                        Outcome::Continue => {
+                            if matches!(command, PickerCommand::Ignore) {
+                                continue;
+                            }
+                            if matches!(
+                                command,
+                                PickerCommand::Insert(_) | PickerCommand::Backspace
+                            ) {
+                                ranked = rank_entries(&state.query, entries);
+                            }
+                            break;
+                        }
+                        Outcome::Cancel => return Ok(None),
+                        Outcome::Submit => {
+                            return Ok(ranked.get(state.selected).map(|entry| entry.value.clone()));
+                        }
+                    }
+                }
+                Event::Resize(..) => break,
+                _ => {}
             }
         }
     }
@@ -136,31 +154,31 @@ struct PickerState {
 }
 
 impl PickerState {
-    fn apply(&mut self, command: PickerCommand, visible_len: usize) -> PickerOutcome {
+    fn apply(&mut self, command: PickerCommand, visible_len: usize) -> Outcome {
         match command {
-            PickerCommand::Cancel => PickerOutcome::Cancel,
-            PickerCommand::Submit => PickerOutcome::Submit,
+            PickerCommand::Cancel => Outcome::Cancel,
+            PickerCommand::Submit => Outcome::Submit,
             PickerCommand::Up => {
                 self.selected = self.selected.saturating_sub(1);
-                PickerOutcome::Continue
+                Outcome::Continue
             }
             PickerCommand::Down => {
                 if self.selected + 1 < visible_len {
                     self.selected += 1;
                 }
-                PickerOutcome::Continue
+                Outcome::Continue
             }
             PickerCommand::Backspace => {
                 self.query.pop();
                 self.selected = 0;
-                PickerOutcome::Continue
+                Outcome::Continue
             }
             PickerCommand::Insert(ch) => {
                 self.query.push(ch);
                 self.selected = 0;
-                PickerOutcome::Continue
+                Outcome::Continue
             }
-            PickerCommand::Ignore => PickerOutcome::Continue,
+            PickerCommand::Ignore => Outcome::Continue,
         }
     }
 
@@ -182,13 +200,6 @@ enum PickerCommand {
     Submit,
     Cancel,
     Ignore,
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum PickerOutcome {
-    Continue,
-    Submit,
-    Cancel,
 }
 
 fn picker_command(key: event::KeyEvent) -> PickerCommand {
@@ -231,26 +242,13 @@ fn render_picker<T>(
         Span::styled(&state.query, Style::default().add_modifier(Modifier::BOLD)),
         Span::raw(format!("  {} match(es)", ranked.len())),
     ]);
-    frame.render_widget(
-        Paragraph::new(title).block(
-            Block::default()
-                .borders(Borders::ALL)
-                .border_style(Style::default().fg(Color::DarkGray))
-                .title(" search "),
-        ),
-        chunks[0],
-    );
+    frame.render_widget(Paragraph::new(title).block(panel(" search ")), chunks[0]);
 
     if ranked.is_empty() {
         frame.render_widget(
             Paragraph::new("No matches")
                 .style(Style::default().fg(Color::DarkGray))
-                .block(
-                    Block::default()
-                        .borders(Borders::ALL)
-                        .border_style(Style::default().fg(Color::DarkGray))
-                        .title(" candidates "),
-                ),
+                .block(panel(" candidates ")),
             chunks[1],
         );
     } else {
@@ -259,16 +257,12 @@ fn render_picker<T>(
             Cell::from(view.name_header),
             Cell::from(view.detail_header),
         ])
-        .style(
-            Style::default()
-                .fg(Color::DarkGray)
-                .add_modifier(Modifier::BOLD),
-        );
-        let rows = ranked.iter().take(VISIBLE_ROWS).map(|entry| {
+        .style(header_style());
+        let rows = ranked.iter().map(|entry| {
             Row::new([
-                Cell::from(entry.marker.clone()),
-                Cell::from(entry.name.clone()),
-                Cell::from(entry.detail.clone()),
+                Cell::from(entry.marker.as_str()),
+                Cell::from(entry.name.as_str()),
+                Cell::from(entry.detail.as_str()),
             ])
         });
         let table = Table::new(
@@ -280,21 +274,14 @@ fn render_picker<T>(
             ],
         )
         .header(header)
-        .block(
-            Block::default()
-                .borders(Borders::ALL)
-                .border_style(Style::default().fg(Color::DarkGray))
-                .title(" candidates "),
-        )
-        .row_highlight_style(
-            Style::default()
-                .fg(Color::Black)
-                .bg(Color::Cyan)
-                .add_modifier(Modifier::BOLD),
-        )
-        .highlight_symbol("› ");
-        let mut table_state = TableState::default();
-        table_state.select(Some(state.selected.min(VISIBLE_ROWS - 1)));
+        .block(panel(" candidates "))
+        .row_highlight_style(row_highlight_style())
+        .highlight_symbol(HIGHLIGHT_SYMBOL);
+        let scroll_offset = state
+            .selected
+            .saturating_sub(VISIBLE_ROWS.saturating_sub(1));
+        let mut table_state = TableState::default().with_offset(scroll_offset);
+        table_state.select(Some(state.selected));
         frame.render_stateful_widget(table, chunks[1], &mut table_state);
     }
 
@@ -306,24 +293,15 @@ fn render_picker<T>(
                     Span::styled("Selected ", Style::default().fg(Color::DarkGray)),
                     Span::styled(&entry.name, Style::default().fg(Color::White)),
                 ]),
-                Line::from(vec![
-                    Span::styled("Detail   ", Style::default().fg(Color::DarkGray)),
-                    Span::raw(&entry.detail),
-                ]),
-                Line::from(vec![
-                    Span::styled("Action   ", Style::default().fg(Color::DarkGray)),
-                    Span::raw(&entry.action),
-                ]),
+                label_line("Detail   ", &entry.detail),
+                label_line("Action   ", &entry.action),
             ]
         })
         .unwrap_or_else(|| vec![Line::from("No selectable candidate")]);
     frame.render_widget(
-        Paragraph::new(detail).wrap(Wrap { trim: true }).block(
-            Block::default()
-                .borders(Borders::ALL)
-                .border_style(Style::default().fg(Color::DarkGray))
-                .title(" detail "),
-        ),
+        Paragraph::new(detail)
+            .wrap(Wrap { trim: true })
+            .block(panel(" detail ")),
         chunks[2],
     );
 
@@ -372,13 +350,10 @@ mod tests {
 
         assert_eq!(
             state.apply(PickerCommand::Insert('p'), 3),
-            PickerOutcome::Continue
+            Outcome::Continue
         );
-        assert_eq!(state.apply(PickerCommand::Down, 3), PickerOutcome::Continue);
-        assert_eq!(
-            state.apply(PickerCommand::Backspace, 3),
-            PickerOutcome::Continue
-        );
+        assert_eq!(state.apply(PickerCommand::Down, 3), Outcome::Continue);
+        assert_eq!(state.apply(PickerCommand::Backspace, 3), Outcome::Continue);
 
         assert_eq!(state.query, "");
         assert_eq!(state.selected, 0);
@@ -465,5 +440,44 @@ mod tests {
             .expect("draw");
 
         assert_snapshot!(terminal.backend());
+    }
+
+    #[test]
+    fn render_picker_scrolls_candidates_to_selected_entry() {
+        let entries = (1..=20)
+            .map(|number| PickerEntry {
+                value: number,
+                marker: format!("#{number}"),
+                name: format!("candidate-{number:02}"),
+                detail: format!("branch-{number:02}"),
+                action: format!("create worktree {number:02}"),
+                search_text: format!("candidate-{number:02} branch-{number:02}"),
+            })
+            .collect::<Vec<_>>();
+        let ranked: Vec<_> = entries.iter().collect();
+        let state = PickerState {
+            query: String::new(),
+            selected: 15,
+        };
+        let mut terminal = Terminal::new(TestBackend::new(88, 28)).expect("terminal");
+
+        terminal
+            .draw(|frame| {
+                render_picker(
+                    frame,
+                    &state,
+                    &ranked,
+                    PickerView {
+                        prompt: "git ws pr>",
+                        marker_header: "PR",
+                        name_header: "Title",
+                        detail_header: "Head",
+                    },
+                );
+            })
+            .expect("draw");
+
+        let screen = format!("{:?}", terminal.backend());
+        assert!(screen.contains("#16"), "{screen}");
     }
 }

@@ -1,7 +1,5 @@
-use std::collections::hash_map::DefaultHasher;
 use std::fs;
-use std::hash::{Hash, Hasher};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::process::Command;
 
 use anyhow::{Context, Result, anyhow};
@@ -14,6 +12,10 @@ use crate::git::{
     primary_worktree_root,
 };
 use crate::path_to_str;
+
+const MAX_PATH_FALLBACK_ATTEMPTS: usize = 1000;
+const FNV_OFFSET_BASIS: u64 = 0xcbf29ce484222325;
+const FNV_PRIME: u64 = 0x100000001b3;
 
 #[derive(Debug, Clone)]
 pub struct CreateWorktreeOptions {
@@ -34,9 +36,10 @@ pub fn create_worktree(options: CreateWorktreeOptions) -> Result<PathBuf> {
     let git_config = load_git_config();
     let base_anchor = primary_worktree_root()?;
     let base_dir = resolve_base_dir(&base_anchor, &file_config, &git_config);
-    let path = options
-        .path
-        .unwrap_or_else(|| base_dir.join(path_segment_for_branch(&options.branch)));
+    let path = match options.path {
+        Some(path) => path,
+        None => worktree_path_for_branch(&base_dir, &options.branch)?,
+    };
 
     let should_run_init = should_run_init(options.run_init, &file_config);
     if should_run_init {
@@ -120,8 +123,40 @@ pub fn path_segment_for_branch(branch: &str) -> String {
     }
 }
 
+fn worktree_path_for_branch(base_dir: &Path, branch: &str) -> Result<PathBuf> {
+    let segment = path_segment_for_branch(branch);
+    let path = base_dir.join(&segment);
+    if !path.exists() {
+        return Ok(path);
+    }
+
+    let fallback_segment = format!("{segment}-{}", stable_branch_hash(branch));
+    let fallback = base_dir.join(&fallback_segment);
+    if !fallback.exists() {
+        return Ok(fallback);
+    }
+
+    for suffix in 2..=MAX_PATH_FALLBACK_ATTEMPTS {
+        let candidate = base_dir.join(format!("{fallback_segment}-{suffix}"));
+        if !candidate.exists() {
+            return Ok(candidate);
+        }
+    }
+
+    Err(anyhow!(
+        "could not find unused worktree path for branch {branch}"
+    ))
+}
+
 fn fallback_path_segment(branch: &str) -> String {
-    let mut hasher = DefaultHasher::new();
-    branch.hash(&mut hasher);
-    format!("worktree-{:016x}", hasher.finish())
+    format!("worktree-{}", stable_branch_hash(branch))
+}
+
+fn stable_branch_hash(branch: &str) -> String {
+    let mut hash = FNV_OFFSET_BASIS;
+    for byte in branch.as_bytes() {
+        hash ^= u64::from(*byte);
+        hash = hash.wrapping_mul(FNV_PRIME);
+    }
+    format!("{hash:016x}")
 }
