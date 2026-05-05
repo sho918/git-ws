@@ -149,6 +149,33 @@ fn open_query_prints_existing_worktree_path_as_last_line() {
 }
 
 #[test]
+fn open_remote_query_tracks_remote_branch() {
+    let repo = TestRepo::with_remote();
+    repo.create_remote_branch("feature/remote-query");
+    git(repo.path(), ["branch", "-D", "feature/remote-query"]);
+
+    let output = command_output(
+        repo.path(),
+        ["open", "--type", "remote", "feature/remote-query"],
+    );
+
+    assert_success(&output);
+    let current = git(repo.path(), ["branch", "--show-current"]);
+    assert_eq!(
+        String::from_utf8_lossy(&current.stdout).trim(),
+        "feature/remote-query"
+    );
+    let upstream = git(
+        repo.path(),
+        ["rev-parse", "--abbrev-ref", "--symbolic-full-name", "@{u}"],
+    );
+    assert_eq!(
+        String::from_utf8_lossy(&upstream.stdout).trim(),
+        "origin/feature/remote-query"
+    );
+}
+
+#[test]
 fn cleanup_dry_run_handles_unborn_repository() {
     let repo = TestRepo::unborn();
 

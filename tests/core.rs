@@ -4,7 +4,11 @@ use git_ws::candidates::{Candidate, CandidateFilter, merge_candidates, rank_cand
 use git_ws::cleanup::{CleanupDisposition, CleanupInput, classify_cleanup_candidate};
 use git_ws::config::{FileConfig, GitConfig, load_file_config, resolve_base_dir};
 use git_ws::git::{Worktree, parse_worktree_porcelain};
-use git_ws::github::slugify_title;
+use git_ws::github::{
+    IssueListItem, PullRequestListItem, issue_picker_entries, parse_issue_list_json,
+    parse_pr_list_json, pr_picker_entries, slugify_title,
+};
+use git_ws::picker::{PickerEntry, rank_entries};
 use git_ws::shell::init_script;
 use git_ws::worktree::path_segment_for_branch;
 
@@ -158,6 +162,74 @@ fn fuzzy_ranking_returns_matching_candidates_only() {
             .collect::<Vec<_>>(),
         vec!["feature/worktree-cleanup"]
     );
+}
+
+#[test]
+fn picker_entries_match_search_text_beyond_display_name() {
+    let entries = vec![
+        PickerEntry::new(
+            "7".to_string(),
+            "#7".to_string(),
+            "Add PR worktree".to_string(),
+            "feature/pr-head".to_string(),
+            "create PR worktree".to_string(),
+            "#7 Add PR worktree feature/pr-head".to_string(),
+        ),
+        PickerEntry::new(
+            "8".to_string(),
+            "#8".to_string(),
+            "Fix cleanup".to_string(),
+            "feature/cleanup".to_string(),
+            "create PR worktree".to_string(),
+            "#8 Fix cleanup feature/cleanup".to_string(),
+        ),
+    ];
+
+    let ranked = rank_entries("pr head", &entries);
+
+    assert_eq!(ranked[0].value, "7");
+}
+
+#[test]
+fn parses_github_issue_list_and_builds_picker_entries() {
+    let issues = parse_issue_list_json(br#"[{"number":42,"title":"Fix worktree cleanup"}]"#)
+        .expect("issue list should parse");
+
+    assert_eq!(
+        issues,
+        vec![IssueListItem {
+            number: 42,
+            title: "Fix worktree cleanup".to_string(),
+        }]
+    );
+
+    let entries = issue_picker_entries(&issues);
+    assert_eq!(entries[0].value, "42");
+    assert_eq!(entries[0].marker, "#42");
+    assert!(entries[0].search_text.contains("Fix worktree cleanup"));
+}
+
+#[test]
+fn parses_github_pr_list_and_builds_picker_entries() {
+    let prs = parse_pr_list_json(
+        br#"[{"number":7,"title":"Add PR worktree","headRefName":"feature/pr-head","isCrossRepository":false}]"#,
+    )
+    .expect("PR list should parse");
+
+    assert_eq!(
+        prs,
+        vec![PullRequestListItem {
+            number: 7,
+            title: "Add PR worktree".to_string(),
+            head_ref_name: "feature/pr-head".to_string(),
+            is_cross_repository: false,
+        }]
+    );
+
+    let entries = pr_picker_entries(&prs);
+    assert_eq!(entries[0].value, "7");
+    assert_eq!(entries[0].marker, "#7");
+    assert!(entries[0].search_text.contains("feature/pr-head"));
 }
 
 #[test]

@@ -4,21 +4,22 @@ use anyhow::{Context, Result, anyhow};
 use serde::Deserialize;
 
 use crate::git::{git_status, ref_exists};
+use crate::picker::PickerEntry;
 use crate::worktree::{CreateWorktreeOptions, create_worktree, find_worktree_for_branch};
 
-#[derive(Debug, Deserialize)]
-struct IssueView {
-    number: u64,
-    title: String,
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+pub struct IssueListItem {
+    pub number: u64,
+    pub title: String,
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
 #[serde(rename_all = "camelCase")]
-struct PullRequestView {
-    number: u64,
-    title: String,
-    head_ref_name: String,
-    is_cross_repository: bool,
+pub struct PullRequestListItem {
+    pub number: u64,
+    pub title: String,
+    pub head_ref_name: String,
+    pub is_cross_repository: bool,
 }
 
 pub fn create_issue_worktree(
@@ -27,7 +28,7 @@ pub fn create_issue_worktree(
     branch: Option<String>,
     run_init: bool,
 ) -> Result<()> {
-    let issue: IssueView = gh_json(["issue", "view", id, "--json", "number,title"])?;
+    let issue: IssueListItem = gh_json(["issue", "view", id, "--json", "number,title"])?;
     let slug = slugify_title(&issue.title);
     let branch = branch.unwrap_or_else(|| format!("issue/{}-{slug}", issue.number));
     create_worktree(CreateWorktreeOptions {
@@ -40,7 +41,7 @@ pub fn create_issue_worktree(
 }
 
 pub fn create_pr_worktree(id: &str, branch: Option<String>, run_init: bool) -> Result<()> {
-    let pr: PullRequestView = gh_json([
+    let pr: PullRequestListItem = gh_json([
         "pr",
         "view",
         id,
@@ -83,6 +84,78 @@ pub fn create_pr_worktree(id: &str, branch: Option<String>, run_init: bool) -> R
         run_init,
     })?;
     Ok(())
+}
+
+pub fn list_open_issues() -> Result<Vec<IssueListItem>> {
+    gh_json([
+        "issue",
+        "list",
+        "--state",
+        "open",
+        "--limit",
+        "100",
+        "--json",
+        "number,title",
+    ])
+}
+
+pub fn list_open_prs() -> Result<Vec<PullRequestListItem>> {
+    gh_json([
+        "pr",
+        "list",
+        "--state",
+        "open",
+        "--limit",
+        "100",
+        "--json",
+        "number,title,headRefName,isCrossRepository",
+    ])
+}
+
+pub fn parse_issue_list_json(input: &[u8]) -> Result<Vec<IssueListItem>> {
+    serde_json::from_slice(input).context("failed to parse gh issue list JSON")
+}
+
+pub fn parse_pr_list_json(input: &[u8]) -> Result<Vec<PullRequestListItem>> {
+    serde_json::from_slice(input).context("failed to parse gh PR list JSON")
+}
+
+pub fn issue_picker_entries(issues: &[IssueListItem]) -> Vec<PickerEntry<String>> {
+    issues
+        .iter()
+        .map(|issue| {
+            let number = issue.number.to_string();
+            PickerEntry::new(
+                number.clone(),
+                format!("#{number}"),
+                issue.title.clone(),
+                "open issue".to_string(),
+                format!("create worktree for issue #{number}"),
+                format!("#{number} {}", issue.title),
+            )
+        })
+        .collect()
+}
+
+pub fn pr_picker_entries(prs: &[PullRequestListItem]) -> Vec<PickerEntry<String>> {
+    prs.iter()
+        .map(|pr| {
+            let number = pr.number.to_string();
+            let detail = if pr.is_cross_repository {
+                format!("fork:{}", pr.head_ref_name)
+            } else {
+                pr.head_ref_name.clone()
+            };
+            PickerEntry::new(
+                number.clone(),
+                format!("#{number}"),
+                pr.title.clone(),
+                detail,
+                format!("create worktree for PR #{number}"),
+                format!("#{number} {} {}", pr.title, pr.head_ref_name),
+            )
+        })
+        .collect()
 }
 
 pub fn slugify_title(title: &str) -> String {

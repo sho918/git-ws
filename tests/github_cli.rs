@@ -27,6 +27,29 @@ exit 1
 }
 
 #[test]
+fn issue_without_id_loads_open_issues_before_interactive_picker() {
+    let repo = TestRepo::with_remote();
+    let fake_bin = fake_gh(
+        r##"
+if [ "$1" = "issue" ] && [ "$2" = "list" ]; then
+  printf '[{"number":42,"title":"Fix worktree cleanup"}]'
+  exit 0
+fi
+printf 'unexpected gh args: %s %s\n' "$1" "$2" >&2
+exit 1
+"##,
+    );
+
+    let output = command_output_with_path(repo.path(), fake_bin.path(), ["issue", "--no-init"]);
+
+    assert!(!output.status.success());
+    assert!(
+        String::from_utf8_lossy(&output.stderr)
+            .contains("interactive picker requires a terminal or query argument")
+    );
+}
+
+#[test]
 fn same_repo_pr_uses_remote_head_as_start_point() {
     let repo = TestRepo::with_remote();
     repo.create_remote_branch("feature/pr-head");
@@ -45,6 +68,29 @@ exit 1
     assert_success(&output);
     let path = String::from_utf8_lossy(&output.stdout).trim().to_string();
     assert!(path.ends_with(".worktrees/feature-pr-head"));
+}
+
+#[test]
+fn pr_without_id_loads_open_prs_before_interactive_picker() {
+    let repo = TestRepo::with_remote();
+    let fake_bin = fake_gh(
+        r##"
+if [ "$1" = "pr" ] && [ "$2" = "list" ]; then
+  printf '[{"number":7,"title":"Add PR worktree","headRefName":"feature/pr-head","isCrossRepository":false}]'
+  exit 0
+fi
+printf 'unexpected gh args: %s %s\n' "$1" "$2" >&2
+exit 1
+"##,
+    );
+
+    let output = command_output_with_path(repo.path(), fake_bin.path(), ["pr", "--no-init"]);
+
+    assert!(!output.status.success());
+    assert!(
+        String::from_utf8_lossy(&output.stderr)
+            .contains("interactive picker requires a terminal or query argument")
+    );
 }
 
 #[test]

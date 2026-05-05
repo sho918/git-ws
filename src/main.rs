@@ -6,8 +6,11 @@ use anyhow::{Result, anyhow};
 use git_ws::candidates::{Candidate, CandidateFilter, load_candidates};
 use git_ws::cleanup::{CleanupOptions, run_cleanup};
 use git_ws::git::{branch_exists, current_branch, default_branch, emit_cd_path, git_status};
-use git_ws::github::{create_issue_worktree, create_pr_worktree};
-use git_ws::picker::pick_candidate;
+use git_ws::github::{
+    create_issue_worktree, create_pr_worktree, issue_picker_entries, list_open_issues,
+    list_open_prs, pr_picker_entries,
+};
+use git_ws::picker::{PickerView, pick_candidate, pick_entry};
 use git_ws::shell::init_script;
 use git_ws::worktree::{CreateWorktreeOptions, create_worktree, find_worktree_for_branch};
 use lexopt::prelude::*;
@@ -125,12 +128,56 @@ fn cmd_new(args: Vec<OsString>) -> Result<()> {
 
 fn cmd_issue(args: Vec<OsString>) -> Result<()> {
     let issue = parse_issue_args(args)?;
-    create_issue_worktree(&issue.id, issue.base, issue.branch, issue.run_init)
+    let id = match issue.id {
+        Some(id) => Some(id),
+        None => pick_issue_id()?,
+    };
+    let Some(id) = id else {
+        return Ok(());
+    };
+    create_issue_worktree(&id, issue.base, issue.branch, issue.run_init)
 }
 
 fn cmd_pr(args: Vec<OsString>) -> Result<()> {
     let pr = parse_pr_args(args)?;
-    create_pr_worktree(&pr.id, pr.branch, pr.run_init)
+    let id = match pr.id {
+        Some(id) => Some(id),
+        None => pick_pr_id()?,
+    };
+    let Some(id) = id else {
+        return Ok(());
+    };
+    create_pr_worktree(&id, pr.branch, pr.run_init)
+}
+
+fn pick_issue_id() -> Result<Option<String>> {
+    let issues = list_open_issues()?;
+    let entries = issue_picker_entries(&issues);
+    pick_entry(
+        &entries,
+        None,
+        PickerView {
+            prompt: "git ws issue>",
+            marker_header: "Issue",
+            name_header: "Title",
+            detail_header: "Detail",
+        },
+    )
+}
+
+fn pick_pr_id() -> Result<Option<String>> {
+    let prs = list_open_prs()?;
+    let entries = pr_picker_entries(&prs);
+    pick_entry(
+        &entries,
+        None,
+        PickerView {
+            prompt: "git ws pr>",
+            marker_header: "PR",
+            name_header: "Title",
+            detail_header: "Head",
+        },
+    )
 }
 
 fn cmd_cleanup(args: Vec<OsString>) -> Result<()> {
@@ -305,7 +352,7 @@ fn parse_new_args(args: Vec<OsString>) -> Result<NewArgs> {
 
 #[derive(Debug)]
 struct IssueArgs {
-    id: String,
+    id: Option<String>,
     base: Option<String>,
     branch: Option<String>,
     run_init: bool,
@@ -327,7 +374,7 @@ fn parse_issue_args(args: Vec<OsString>) -> Result<IssueArgs> {
         }
     }
     Ok(IssueArgs {
-        id: id.ok_or_else(|| anyhow!("missing issue number or URL"))?,
+        id,
         base,
         branch,
         run_init,
@@ -336,7 +383,7 @@ fn parse_issue_args(args: Vec<OsString>) -> Result<IssueArgs> {
 
 #[derive(Debug)]
 struct PrArgs {
-    id: String,
+    id: Option<String>,
     branch: Option<String>,
     run_init: bool,
 }
@@ -355,7 +402,7 @@ fn parse_pr_args(args: Vec<OsString>) -> Result<PrArgs> {
         }
     }
     Ok(PrArgs {
-        id: id.ok_or_else(|| anyhow!("missing PR number or URL"))?,
+        id,
         branch,
         run_init,
     })
@@ -389,12 +436,15 @@ Usage:
   git ws [open] [query] [--type all|worktree|local|remote]
   git ws list [--json] [--type all|worktree|local|remote]
   git ws new <branch> [--from <ref>] [--path <path>] [--no-init]
-  git ws issue <number|url> [--base <ref>] [--branch <name>] [--no-init]
-  git ws pr <number|url> [--branch <name>] [--no-init]
+  git ws issue [number|url] [--base <ref>] [--branch <name>] [--no-init]
+  git ws pr [number|url] [--branch <name>] [--no-init]
   git ws cleanup [--dry-run] [--yes] [--force] [--json]
   git ws main
   git ws init-shell fish|zsh|bash
   git ws doctor
+
+Run open, issue, or pr without a target to use the interactive fuzzy picker.
+Use `git ws open --type remote` to pick from remote branches only.
 "#
     );
 }
