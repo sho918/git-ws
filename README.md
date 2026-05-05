@@ -4,9 +4,9 @@ Fast Git branch and worktree workspace helper.
 
 ## Install
 
-```sh
-cargo install --path .
-```
+Download the archive for your platform from
+[GitHub Releases](https://github.com/sho918/git-ws/releases), extract it, and
+place the `git-ws` binary somewhere on your `PATH`.
 
 The binary is named `git-ws`, so Git can invoke it as:
 
@@ -70,10 +70,11 @@ on_create = [
 
 Init commands are shown and confirmed the first time per repository/config hash.
 
-## Release
+## Development
 
-Release builds are produced by GitHub Actions when a `vX.Y.Z` tag is pushed.
-See [docs/release.md](docs/release.md) for the full procedure.
+Contributor build and test commands are documented in
+[docs/development.md](docs/development.md). Release steps are documented in
+[docs/release.md](docs/release.md).
 
 ## License
 

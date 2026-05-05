@@ -1,5 +1,8 @@
 # Release Procedure
 
+This document is for maintainers publishing a release. For normal build and
+test commands, see [development.md](development.md).
+
 ## Prerequisites
 
 - The working tree is clean.
