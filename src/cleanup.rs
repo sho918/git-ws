@@ -60,11 +60,7 @@ pub fn run_cleanup(options: CleanupOptions) -> Result<()> {
 
     let safe: Vec<&CleanupInput> = candidates
         .iter()
-        .filter(|input| match classify_cleanup_candidate(input) {
-            CleanupDisposition::SafeDelete => true,
-            CleanupDisposition::SkipCurrent => false,
-            CleanupDisposition::SkipDirty | CleanupDisposition::SkipUnmerged => options.force,
-        })
+        .filter(|input| should_cleanup_candidate(input, options.force))
         .collect();
 
     if safe.is_empty() {
@@ -99,21 +95,45 @@ pub fn run_cleanup(options: CleanupOptions) -> Result<()> {
     Ok(())
 }
 
+fn should_cleanup_candidate(input: &CleanupInput, force: bool) -> bool {
+    match classify_cleanup_candidate(input) {
+        CleanupDisposition::SafeDelete => true,
+        CleanupDisposition::SkipCurrent => false,
+        CleanupDisposition::SkipDirty => force && is_stale_or_merged(input),
+        CleanupDisposition::SkipUnmerged => false,
+    }
+}
+
+fn is_stale_or_merged(input: &CleanupInput) -> bool {
+    input.upstream_gone || input.merged_to_default
+}
+
 pub fn discover_cleanup_candidates() -> Result<Vec<CleanupInput>> {
-    let (current_root, worktrees, merged, local) = thread::scope(|scope| -> Result<_> {
+    let (current_root, worktrees, local) = thread::scope(|scope| -> Result<_> {
         let current_root = scope.spawn(current_worktree_root);
         let worktrees = scope.spawn(list_worktrees);
-        let merged = scope.spawn(merged_branches);
         let local = scope.spawn(local_branches_with_track);
         Ok((
             current_root.join().expect("current_worktree_root thread")?,
             worktrees.join().expect("list_worktrees thread")?,
-            merged.join().expect("merged_branches thread")?,
             local.join().expect("local_branches_with_track thread")?,
         ))
     })?;
+
+    if local.is_empty() {
+        return Ok(Vec::new());
+    }
+
+    let default = default_branch().ok_or_else(|| {
+        anyhow!("default branch could not be determined; set origin/HEAD or use main/master")
+    })?;
+    let default_local = default
+        .strip_prefix("origin/")
+        .unwrap_or(&default)
+        .to_string();
+    let protected = protected_branches_for_default(&default_local);
+    let merged = merged_branches(&default)?;
     let merged: HashSet<String> = merged.into_iter().collect();
-    let protected = protected_branches();
 
     let dirty_paths = check_worktrees_dirty(&worktrees);
 
@@ -178,33 +198,16 @@ fn local_branches_with_track() -> Result<Vec<(String, bool)>> {
     .collect())
 }
 
-fn merged_branches() -> Result<Vec<String>> {
-    let default = default_branch();
-    let default_local = default
-        .strip_prefix("origin/")
-        .unwrap_or(&default)
-        .to_string();
-    let output = match git_output([
-        "branch",
-        "--format=%(refname:short)",
-        "--merged",
-        default.as_str(),
-    ]) {
+fn merged_branches(default: &str) -> Result<Vec<String>> {
+    let output = match git_output(["branch", "--format=%(refname:short)", "--merged", default]) {
         Ok(output) => output,
         Err(_) => return Ok(Vec::new()),
     };
-    let protected = protected_branches_for_default(&default_local);
     Ok(output
         .lines()
         .map(|line| line.trim_start_matches('*').trim().to_string())
-        .filter(|branch| !branch.is_empty() && !protected.contains(branch))
+        .filter(|branch| !branch.is_empty())
         .collect())
-}
-
-fn protected_branches() -> HashSet<String> {
-    let default = default_branch();
-    let default_local = default.strip_prefix("origin/").unwrap_or(&default);
-    protected_branches_for_default(default_local)
 }
 
 fn protected_branches_for_default(default_local: &str) -> HashSet<String> {
@@ -254,13 +257,19 @@ fn prompt_cleanup_selection(max: usize) -> Result<Vec<usize>> {
 }
 
 fn delete_cleanup_candidate(input: &CleanupInput, force: bool) -> Result<()> {
+    if input.worktree_path.is_some() && !force && !input.merged_to_default {
+        return Err(anyhow!(
+            "refusing to remove worktree for unmerged branch without --force: {}",
+            input.branch
+        ));
+    }
     if let Some(path) = &input.worktree_path {
-        let path = path_to_str(path)?;
+        let mut args: Vec<&str> = vec!["worktree", "remove"];
         if force {
-            git_status(["worktree", "remove", "--force", path])?;
-        } else {
-            git_status(["worktree", "remove", path])?;
+            args.push("--force");
         }
+        args.push(path_to_str(path)?);
+        git_status(args)?;
     }
     let flag = if force { "-D" } else { "-d" };
     git_status(["branch", flag, input.branch.as_str()])

@@ -182,6 +182,10 @@ pub fn branch_exists(branch: &str) -> bool {
     ref_exists(&format!("refs/heads/{branch}"))
 }
 
+pub fn switch_target_exists(branch: &str) -> bool {
+    branch_exists(branch) || ref_exists(&format!("refs/remotes/origin/{branch}"))
+}
+
 pub fn default_start_point() -> String {
     first_existing_ref(&[
         "origin/HEAD",
@@ -198,13 +202,29 @@ pub fn current_worktree_root() -> Result<PathBuf> {
     Ok(ensure_repo()?.root)
 }
 
+pub fn primary_worktree_root() -> Result<PathBuf> {
+    Ok(list_worktrees()?
+        .into_iter()
+        .next()
+        .map(|worktree| worktree.path)
+        .unwrap_or(ensure_repo()?.root))
+}
+
 pub fn current_branch() -> Result<String> {
     Ok(git_output(["branch", "--show-current"])?.trim().to_string())
 }
 
-pub fn default_branch() -> String {
-    first_existing_ref(&["origin/main", "origin/master", "main", "master"])
-        .unwrap_or_else(|| "HEAD".to_string())
+pub fn default_branch() -> Option<String> {
+    symbolic_ref_short("refs/remotes/origin/HEAD")
+        .or_else(|| first_existing_ref(&["origin/main", "origin/master", "main", "master"]))
+}
+
+pub fn default_local_branch() -> String {
+    let default = default_branch().unwrap_or_else(|| "HEAD".to_string());
+    default
+        .strip_prefix("origin/")
+        .unwrap_or(&default)
+        .to_string()
 }
 
 pub fn ref_exists(refname: &str) -> bool {
@@ -221,6 +241,12 @@ fn first_existing_ref(candidates: &[&str]) -> Option<String> {
         .iter()
         .find(|candidate| ref_exists(candidate))
         .map(|candidate| (*candidate).to_string())
+}
+
+fn symbolic_ref_short(refname: &str) -> Option<String> {
+    let value = git_output(["symbolic-ref", "--quiet", "--short", refname]).ok()?;
+    let value = value.trim();
+    (!value.is_empty()).then(|| value.to_string())
 }
 
 pub fn short_branch(refname: &str) -> String {

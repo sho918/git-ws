@@ -6,9 +6,12 @@ use std::process::Command;
 
 use anyhow::{Context, Result, anyhow};
 
-use crate::config::{ensure_init_trusted, load_file_config, load_git_config, resolve_base_dir};
+use crate::config::{
+    FileConfig, ensure_init_trusted, load_file_config, load_git_config, resolve_base_dir,
+};
 use crate::git::{
     branch_exists, default_start_point, emit_cd_path, ensure_repo, git_status, list_worktrees,
+    primary_worktree_root,
 };
 use crate::path_to_str;
 
@@ -29,12 +32,13 @@ pub fn create_worktree(options: CreateWorktreeOptions) -> Result<PathBuf> {
     let repo = ensure_repo()?;
     let file_config = load_file_config(&repo.root)?;
     let git_config = load_git_config();
-    let base_dir = resolve_base_dir(&repo.root, &file_config, &git_config);
+    let base_anchor = primary_worktree_root()?;
+    let base_dir = resolve_base_dir(&base_anchor, &file_config, &git_config);
     let path = options
         .path
         .unwrap_or_else(|| base_dir.join(path_segment_for_branch(&options.branch)));
 
-    let should_run_init = options.run_init && !file_config.init_commands.is_empty();
+    let should_run_init = should_run_init(options.run_init, &file_config);
     if should_run_init {
         ensure_init_trusted(&repo.root, &file_config)?;
     }
@@ -76,11 +80,24 @@ pub fn create_worktree(options: CreateWorktreeOptions) -> Result<PathBuf> {
     Ok(path)
 }
 
+pub fn ensure_worktree_init_trusted(run_init: bool) -> Result<()> {
+    let repo = ensure_repo()?;
+    let file_config = load_file_config(&repo.root)?;
+    if should_run_init(run_init, &file_config) {
+        ensure_init_trusted(&repo.root, &file_config)?;
+    }
+    Ok(())
+}
+
 pub fn find_worktree_for_branch(branch: &str) -> Result<Option<PathBuf>> {
     Ok(list_worktrees()?
         .into_iter()
         .find(|worktree| worktree.branch.as_deref() == Some(branch))
         .map(|worktree| worktree.path))
+}
+
+fn should_run_init(run_init: bool, file_config: &FileConfig) -> bool {
+    run_init && !file_config.init_commands.is_empty()
 }
 
 pub fn path_segment_for_branch(branch: &str) -> String {

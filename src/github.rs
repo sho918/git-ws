@@ -5,7 +5,9 @@ use serde::Deserialize;
 
 use crate::git::git_status;
 use crate::picker::PickerEntry;
-use crate::worktree::{CreateWorktreeOptions, create_worktree, find_worktree_for_branch};
+use crate::worktree::{
+    CreateWorktreeOptions, create_worktree, ensure_worktree_init_trusted, find_worktree_for_branch,
+};
 
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
 pub struct IssueListItem {
@@ -67,17 +69,17 @@ pub fn create_pr_worktree(id: &str, branch: Option<String>, run_init: bool) -> R
         return Ok(());
     }
 
-    let start_point = if pr.is_cross_repository {
-        fetch_into_branch(&format!("refs/pull/{}/head", pr.number), &branch)?;
-        None
+    let refspec = if pr.is_cross_repository {
+        format!("refs/pull/{}/head", pr.number)
     } else {
-        fetch_into_branch(&pr.head_ref_name, &branch)?;
-        None
+        pr.head_ref_name.clone()
     };
+    ensure_worktree_init_trusted(run_init)?;
+    fetch_into_branch(&refspec, &branch)?;
 
     create_worktree(CreateWorktreeOptions {
         branch,
-        start_point,
+        start_point: None,
         path: None,
         run_init,
     })?;

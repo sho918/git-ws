@@ -5,7 +5,9 @@ use std::path::PathBuf;
 use anyhow::{Result, anyhow};
 use git_ws::candidates::{Candidate, CandidateFilter, load_candidates};
 use git_ws::cleanup::{CleanupOptions, run_cleanup};
-use git_ws::git::{branch_exists, current_branch, default_branch, emit_cd_path, git_status};
+use git_ws::git::{
+    current_branch, default_local_branch, emit_cd_path, git_status, switch_target_exists,
+};
 use git_ws::github::{
     create_issue_worktree, create_pr_worktree, issue_picker_entries, list_open_issues,
     list_open_prs, pr_picker_entries,
@@ -188,19 +190,13 @@ fn cmd_cleanup(args: Vec<OsString>) -> Result<()> {
 fn cmd_main(target: MainTarget) -> Result<()> {
     let branch = match target {
         MainTarget::Master => "master".to_string(),
-        MainTarget::Default => {
-            let default = default_branch();
-            default
-                .strip_prefix("origin/")
-                .unwrap_or(default.as_str())
-                .to_string()
-        }
+        MainTarget::Default => default_local_branch(),
     };
     if let Some(path) = find_worktree_for_branch(&branch)? {
         emit_cd_path(&path)?;
         return Ok(());
     }
-    if current_branch().ok().as_deref() != Some(branch.as_str()) && branch_exists(&branch) {
+    if current_branch().ok().as_deref() != Some(branch.as_str()) && switch_target_exists(&branch) {
         git_status(["switch", branch.as_str()])?;
     }
     emit_cd_path(&std::env::current_dir()?)?;

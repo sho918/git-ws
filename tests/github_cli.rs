@@ -4,7 +4,9 @@ use std::fs;
 use std::os::unix::fs::PermissionsExt;
 use std::path::Path;
 
-use support::{TestRepo, assert_success, command_output_with_path, git, last_stdout_line};
+use support::{
+    TestRepo, assert_success, command_output_with_path, configure_git_user, git, last_stdout_line,
+};
 
 #[test]
 fn issue_creates_slugged_worktree_without_network() {
@@ -85,9 +87,7 @@ fn same_repo_pr_fetches_updated_head_before_creating_worktree() {
             clone_path.to_str().expect("clone path"),
         ],
     );
-    git(&clone_path, ["config", "user.name", "Test User"]);
-    git(&clone_path, ["config", "user.email", "test@example.com"]);
-    git(&clone_path, ["config", "commit.gpgsign", "false"]);
+    configure_git_user(&clone_path);
     git(&clone_path, ["switch", "feature/pr-head"]);
     fs::write(clone_path.join("new-pr-head.txt"), "new\n").expect("write new PR head");
     git(&clone_path, ["add", "new-pr-head.txt"]);
@@ -119,6 +119,48 @@ exit 1
     assert_eq!(
         String::from_utf8_lossy(&worktree_head.stdout).trim(),
         remote_head
+    );
+}
+
+#[test]
+fn pr_rejects_untrusted_init_before_fetching_branch() {
+    let repo = TestRepo::with_remote();
+    repo.create_remote_branch("feature/pr-needs-trust");
+    git(repo.path(), ["branch", "-D", "feature/pr-needs-trust"]);
+    fs::write(
+        repo.path().join(".git-ws.toml"),
+        r#"
+[init]
+on_create = ["echo init"]
+"#,
+    )
+    .expect("write config");
+    let fake_bin = fake_gh(
+        r#"
+if [ "$1" = "pr" ]; then
+  printf '{"number":7,"title":"Needs Trust","headRefName":"feature/pr-needs-trust","isCrossRepository":false}'
+  exit 0
+fi
+exit 1
+"#,
+    );
+
+    let output = command_output_with_path(repo.path(), fake_bin.path(), ["pr", "7"]);
+
+    assert!(!output.status.success());
+    assert!(
+        String::from_utf8_lossy(&output.stderr).contains("init commands are not trusted"),
+        "expected trust failure, got:\n{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let branches = git(repo.path(), ["branch", "--list", "feature/pr-needs-trust"]);
+    assert_eq!(String::from_utf8_lossy(&branches.stdout).trim(), "");
+    assert!(
+        !repo
+            .path()
+            .join(".worktrees/feature-pr-needs-trust")
+            .exists(),
+        "worktree should not be created before init trust is accepted"
     );
 }
 

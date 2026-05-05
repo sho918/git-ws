@@ -79,10 +79,14 @@ impl TestRepo {
     }
 
     fn configure_user(&self) {
-        git(self.path(), ["config", "user.name", "Test User"]);
-        git(self.path(), ["config", "user.email", "test@example.com"]);
-        git(self.path(), ["config", "commit.gpgsign", "false"]);
+        configure_git_user(self.path());
     }
+}
+
+pub fn configure_git_user(cwd: &Path) {
+    git(cwd, ["config", "user.name", "Test User"]);
+    git(cwd, ["config", "user.email", "test@example.com"]);
+    git(cwd, ["config", "commit.gpgsign", "false"]);
 }
 
 pub fn command_output<const N: usize>(cwd: &Path, args: [&str; N]) -> Output {
