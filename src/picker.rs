@@ -196,6 +196,8 @@ fn picker_command(key: event::KeyEvent) -> PickerCommand {
         KeyCode::Char('c') if key.modifiers.contains(KeyModifiers::CONTROL) => {
             PickerCommand::Cancel
         }
+        KeyCode::Char('n') if key.modifiers.contains(KeyModifiers::CONTROL) => PickerCommand::Down,
+        KeyCode::Char('p') if key.modifiers.contains(KeyModifiers::CONTROL) => PickerCommand::Up,
         KeyCode::Esc => PickerCommand::Cancel,
         KeyCode::Enter => PickerCommand::Submit,
         KeyCode::Up => PickerCommand::Up,
@@ -326,7 +328,7 @@ fn render_picker<T>(
     );
 
     frame.render_widget(
-        Paragraph::new("type to filter  ↑/↓ move  enter select  esc cancel")
+        Paragraph::new("type to filter  ↑/↓ ctrl+n/p move  enter select  esc cancel")
             .style(Style::default().fg(Color::DarkGray)),
         chunks[3],
     );
@@ -392,6 +394,31 @@ mod tests {
         state.clamp_selection(2);
 
         assert_eq!(state.selected, 1);
+    }
+
+    #[test]
+    fn picker_command_maps_control_n_and_p_to_movement() {
+        assert_eq!(
+            picker_command(event::KeyEvent::new(
+                KeyCode::Char('n'),
+                KeyModifiers::CONTROL,
+            )),
+            PickerCommand::Down
+        );
+        assert_eq!(
+            picker_command(event::KeyEvent::new(
+                KeyCode::Char('p'),
+                KeyModifiers::CONTROL,
+            )),
+            PickerCommand::Up
+        );
+        assert_eq!(
+            picker_command(event::KeyEvent::new(
+                KeyCode::Char('c'),
+                KeyModifiers::CONTROL,
+            )),
+            PickerCommand::Cancel
+        );
     }
 
     #[test]

@@ -405,6 +405,8 @@ fn cleanup_command(key: event::KeyEvent) -> CleanupCommand {
         KeyCode::Char('c') if key.modifiers.contains(KeyModifiers::CONTROL) => {
             CleanupCommand::Cancel
         }
+        KeyCode::Char('n') if key.modifiers.contains(KeyModifiers::CONTROL) => CleanupCommand::Down,
+        KeyCode::Char('p') if key.modifiers.contains(KeyModifiers::CONTROL) => CleanupCommand::Up,
         KeyCode::Esc => CleanupCommand::Cancel,
         KeyCode::Enter => CleanupCommand::Submit,
         KeyCode::Up => CleanupCommand::Up,
@@ -523,7 +525,7 @@ fn render_cleanup_selector(
     );
 
     frame.render_widget(
-        Paragraph::new("space toggle  a all  ↑/↓ move  enter delete  esc cancel")
+        Paragraph::new("space toggle  a all  ↑/↓ ctrl+n/p move  enter delete  esc cancel")
             .style(Style::default().fg(Color::DarkGray)),
         chunks[3],
     );
@@ -612,6 +614,24 @@ mod tests {
 
         assert_eq!(state.selected, 1);
         assert_eq!(state.selected_indices(), vec![0, 1, 2]);
+    }
+
+    #[test]
+    fn cleanup_command_maps_control_n_and_p_to_movement() {
+        assert_eq!(
+            cleanup_command(event::KeyEvent::new(
+                KeyCode::Char('n'),
+                KeyModifiers::CONTROL,
+            )),
+            CleanupCommand::Down
+        );
+        assert_eq!(
+            cleanup_command(event::KeyEvent::new(
+                KeyCode::Char('p'),
+                KeyModifiers::CONTROL,
+            )),
+            CleanupCommand::Up
+        );
     }
 
     #[test]

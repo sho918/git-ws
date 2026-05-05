@@ -1,6 +1,6 @@
 ---
 source: src/picker.rs
-assertion_line: 473
+assertion_line: 471
 expression: terminal.backend()
 ---
 "┌ search ──────────────────────────────────────────────────────────────────────────────┐"
@@ -20,4 +20,4 @@ expression: terminal.backend()
 "│Detail   feat/implement-git-ws-cli                                                    │"
 "│Action   create worktree for PR #1                                                    │"
 "└──────────────────────────────────────────────────────────────────────────────────────┘"
-"type to filter  ↑/↓ move  enter select  esc cancel                                      "
+"type to filter  ↑/↓ ctrl+n/p move  enter select  esc cancel                             "

@@ -1,6 +1,6 @@
 ---
 source: src/cleanup.rs
-assertion_line: 640
+assertion_line: 668
 expression: terminal.backend()
 ---
 "┌ cleanup ─────────────────────────────────────────────────────────────────────────────────────┐"
@@ -20,4 +20,4 @@ expression: terminal.backend()
 "│Branch  feature/default-merged                                                                │"
 "│Reason  merged                                                                                │"
 "└──────────────────────────────────────────────────────────────────────────────────────────────┘"
-"space toggle  a all  ↑/↓ move  enter delete  esc cancel                                         "
+"space toggle  a all  ↑/↓ ctrl+n/p move  enter delete  esc cancel                                "
