@@ -53,7 +53,15 @@ jobs:
           echo "package_version=${package_version}" >> "$GITHUB_OUTPUT"
 
       - name: Install Rust
-        run: rustup toolchain install "$RUST_VERSION" --profile minimal --component rustfmt --component clippy
+        shell: bash
+        run: |
+          set -euo pipefail
+          if ! command -v rustup >/dev/null 2>&1; then
+            curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y --profile minimal --default-toolchain none
+            echo "$HOME/.cargo/bin" >> "$GITHUB_PATH"
+            export PATH="$HOME/.cargo/bin:$PATH"
+          fi
+          rustup toolchain install "$RUST_VERSION" --profile minimal --component rustfmt --component clippy
 
       - name: Restore Cargo cache
         id: cargo-cache
@@ -113,7 +121,14 @@ jobs:
       - name: Install Rust target
         env:
           RELEASE_TARGET: ${{ matrix.target }}
+        shell: bash
         run: |
+          set -euo pipefail
+          if ! command -v rustup >/dev/null 2>&1; then
+            curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y --profile minimal --default-toolchain none
+            echo "$HOME/.cargo/bin" >> "$GITHUB_PATH"
+            export PATH="$HOME/.cargo/bin:$PATH"
+          fi
           rustup toolchain install "$RUST_VERSION" --profile minimal
           rustup target add --toolchain "$RUST_VERSION" "$RELEASE_TARGET"
 
