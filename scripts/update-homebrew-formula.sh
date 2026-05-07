@@ -25,11 +25,6 @@ if [ ! -f "$sums" ]; then
   exit 2
 fi
 
-if [ ! -f "$formula" ]; then
-  printf 'formula file not found: %s\n' "$formula" >&2
-  exit 2
-fi
-
 checksum_for() {
   name=$1
   checksum=$(awk -v name="$name" '$2 == name { print $1 }' "$sums")
@@ -53,6 +48,7 @@ darwin_intel_sha=$(checksum_for "$darwin_intel")
 linux_intel_sha=$(checksum_for "$linux_intel")
 
 tmp=$(mktemp)
+trap 'rm -f "$tmp"' EXIT
 cat > "$tmp" <<EOF
 class GitWs < Formula
   desc "Fast Git branch and worktree workspace helper"

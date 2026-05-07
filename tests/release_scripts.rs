@@ -19,11 +19,6 @@ fn homebrew_formula_script_updates_urls_and_checksums_from_release_sums() {
     let temp = tempfile::tempdir().expect("create tempdir");
     let formula_dir = temp.path().join("Formula");
     std::fs::create_dir(&formula_dir).expect("create Formula dir");
-    std::fs::write(
-        formula_dir.join("git-ws.rb"),
-        include_str!("../Formula/git-ws.rb"),
-    )
-    .expect("write formula");
     let sums_path = temp.path().join("SHA256SUMS");
     std::fs::write(
         &sums_path,
