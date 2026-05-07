@@ -85,5 +85,7 @@ fn release_workflow_updates_homebrew_formula_after_publishing_release() {
         workflow
             .contains(r#"scripts/update-homebrew-formula.sh "$RELEASE_VERSION" dist/SHA256SUMS"#)
     );
-    assert!(workflow.contains(r#"git push origin "HEAD:${DEFAULT_BRANCH}""#));
+    assert!(workflow.contains("persist-credentials: false"));
+    assert!(workflow.contains("GH_TOKEN: ${{ github.token }}"));
+    assert!(workflow.contains(r#"git push "https://x-access-token:${GH_TOKEN}@github.com/${GITHUB_REPOSITORY}.git" "HEAD:${DEFAULT_BRANCH}""#));
 }
