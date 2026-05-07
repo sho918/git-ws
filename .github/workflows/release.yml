@@ -217,3 +217,45 @@ jobs:
           GH_TOKEN: ${{ github.token }}
           RELEASE_VERSION: ${{ needs.verify.outputs.version }}
         run: gh release create "$RELEASE_VERSION" dist/* --generate-notes --verify-tag
+
+  update-homebrew-formula:
+    name: Update Homebrew formula
+    needs:
+      - verify
+      - publish
+    permissions:
+      contents: write
+    runs-on: ubuntu-slim
+    env:
+      DEFAULT_BRANCH: ${{ github.event.repository.default_branch }}
+      RELEASE_VERSION: ${{ needs.verify.outputs.version }}
+    steps:
+      - name: Checkout default branch
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        with:
+          ref: ${{ github.event.repository.default_branch }}
+          persist-credentials: false
+
+      - name: Download release checksums
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: gh release download "$RELEASE_VERSION" --pattern SHA256SUMS --dir dist
+
+      - name: Update formula
+        run: scripts/update-homebrew-formula.sh "$RELEASE_VERSION" dist/SHA256SUMS
+
+      - name: Commit formula
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          if git diff --quiet -- Formula/git-ws.rb; then
+            echo "Formula already up to date"
+            exit 0
+          fi
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add Formula/git-ws.rb
+          git commit -m "chore: update homebrew formula for ${RELEASE_VERSION}"
+          git push "https://x-access-token:${GH_TOKEN}@github.com/${GITHUB_REPOSITORY}.git" "HEAD:${DEFAULT_BRANCH}"

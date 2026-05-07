@@ -42,6 +42,43 @@ test commands, see [development.md](development.md).
    - `git-ws-vX.Y.Z-x86_64-apple-darwin.tar.gz`
    - `SHA256SUMS`
 
+6. Confirm the `Update Homebrew formula` job succeeds.
+
+   The release workflow updates `Formula/git-ws.rb` from the published release
+   artifact checksums and pushes a follow-up commit to the default branch.
+
+7. If the formula update job fails, update it manually from the published
+   release artifacts.
+
+   ```sh
+   curl -sSL -o SHA256SUMS https://github.com/sho918/git-ws/releases/download/vX.Y.Z/SHA256SUMS
+   ```
+
+   Then run:
+
+   ```sh
+   scripts/update-homebrew-formula.sh vX.Y.Z SHA256SUMS
+   ```
+
+8. Validate and commit the Homebrew formula update.
+
+   ```sh
+   ruby -c Formula/git-ws.rb
+   brew style Formula/git-ws.rb
+   git add Formula/git-ws.rb
+   git commit -m "chore: update homebrew formula for vX.Y.Z"
+   git push origin HEAD
+   ```
+
+9. Validate the published tap formula.
+
+   ```sh
+   brew tap sho918/git-ws https://github.com/sho918/git-ws
+   brew update
+   brew install sho918/git-ws/git-ws
+   brew test sho918/git-ws/git-ws
+   ```
+
 ## Manual Dispatch
 
 Use `workflow_dispatch` only after the matching tag already exists.
