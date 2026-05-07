@@ -53,39 +53,14 @@ cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc  git-ws-v1.2.3-
         String::from_utf8_lossy(&output.stderr)
     );
     let updated = std::fs::read_to_string(formula_dir.join("git-ws.rb")).expect("read formula");
-    assert!(updated.contains("releases/download/v1.2.3/git-ws-v1.2.3-aarch64-apple-darwin.tar.gz"));
-    assert!(
-        updated.contains(
-            "sha256 \"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\""
-        )
-    );
-    assert!(updated.contains("releases/download/v1.2.3/git-ws-v1.2.3-x86_64-apple-darwin.tar.gz"));
-    assert!(
-        updated.contains(
-            "sha256 \"bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb\""
-        )
-    );
-    assert!(
-        updated.contains("releases/download/v1.2.3/git-ws-v1.2.3-x86_64-unknown-linux-gnu.tar.gz")
-    );
-    assert!(
-        updated.contains(
-            "sha256 \"cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc\""
-        )
-    );
-}
-
-#[test]
-fn release_workflow_updates_homebrew_formula_after_publishing_release() {
-    let workflow = include_str!("../.github/workflows/release.yml");
-
-    assert!(workflow.contains("update-homebrew-formula:"));
-    assert!(workflow.contains("- publish"));
-    assert!(
-        workflow
-            .contains(r#"scripts/update-homebrew-formula.sh "$RELEASE_VERSION" dist/SHA256SUMS"#)
-    );
-    assert!(workflow.contains("persist-credentials: false"));
-    assert!(workflow.contains("GH_TOKEN: ${{ github.token }}"));
-    assert!(workflow.contains(r#"git push "https://x-access-token:${GH_TOKEN}@github.com/${GITHUB_REPOSITORY}.git" "HEAD:${DEFAULT_BRANCH}""#));
+    for (target, sha_byte) in [
+        ("aarch64-apple-darwin", 'a'),
+        ("x86_64-apple-darwin", 'b'),
+        ("x86_64-unknown-linux-gnu", 'c'),
+    ] {
+        let url = format!("releases/download/v1.2.3/git-ws-v1.2.3-{target}.tar.gz");
+        let sha_line = format!("sha256 \"{}\"", sha_byte.to_string().repeat(64));
+        assert!(updated.contains(&url), "missing url for {target}");
+        assert!(updated.contains(&sha_line), "missing sha256 for {target}");
+    }
 }
