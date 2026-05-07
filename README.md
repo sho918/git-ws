@@ -4,7 +4,14 @@ Fast Git branch and worktree workspace helper.
 
 ## Install
 
-Download the archive for your platform from
+Install with Homebrew:
+
+```sh
+brew tap sho918/git-ws https://github.com/sho918/git-ws
+brew install sho918/git-ws/git-ws
+```
+
+Alternatively, download the archive for your platform from
 [GitHub Releases](https://github.com/sho918/git-ws/releases), extract it, and
 place the `git-ws` binary somewhere on your `PATH`.
 
