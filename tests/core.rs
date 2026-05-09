@@ -1,4 +1,8 @@
 use std::path::PathBuf;
+use std::process::Command;
+
+#[cfg(unix)]
+use std::os::unix::fs::PermissionsExt;
 
 use git_ws::candidates::{Candidate, CandidateFilter, merge_candidates};
 use git_ws::cleanup::{CleanupDisposition, CleanupInput, classify_cleanup_candidate};
@@ -579,4 +583,69 @@ fn shell_init_uses_side_channel_for_cd_targets() {
         assert!(script.contains("GIT_WS_CD_FILE"), "{shell} missing env var");
         assert!(script.contains("mktemp"), "{shell} missing mktemp");
     }
+}
+
+#[cfg(unix)]
+#[test]
+fn fish_shell_init_wrapper_changes_directory_from_side_channel() {
+    if Command::new("fish").arg("--version").output().is_err() {
+        return;
+    }
+
+    let temp = tempfile::tempdir().expect("tempdir");
+    let bin_dir = temp.path().join("bin");
+    let start_dir = temp.path().join("start");
+    let target_dir = temp.path().join("target");
+    std::fs::create_dir_all(&bin_dir).expect("create fake bin dir");
+    std::fs::create_dir_all(&start_dir).expect("create start dir");
+    std::fs::create_dir_all(&target_dir).expect("create target dir");
+
+    let fake_git = bin_dir.join("git");
+    std::fs::write(
+        &fake_git,
+        r#"#!/bin/sh
+if [ "$1" = "main" ]; then
+  printf '%s\n' "$GIT_WS_TEST_TARGET" > "$GIT_WS_CD_FILE"
+  exit 0
+fi
+exit 127
+"#,
+    )
+    .expect("write fake git");
+    let mut permissions = std::fs::metadata(&fake_git)
+        .expect("fake git metadata")
+        .permissions();
+    permissions.set_mode(0o755);
+    std::fs::set_permissions(&fake_git, permissions).expect("chmod fake git");
+
+    let init_script_path = temp.path().join("init.fish");
+    std::fs::write(&init_script_path, init_script("fish").expect("fish"))
+        .expect("write fish init script");
+
+    let output = Command::new("fish")
+        .arg("-c")
+        .arg(
+            "set -gx PATH \"$GIT_WS_TEST_BIN\" $PATH; \
+             source \"$GIT_WS_TEST_SCRIPT\"; \
+             cd \"$GIT_WS_TEST_START\"; \
+             git main; \
+             pwd",
+        )
+        .env("GIT_WS_TEST_BIN", &bin_dir)
+        .env("GIT_WS_TEST_SCRIPT", &init_script_path)
+        .env("GIT_WS_TEST_START", &start_dir)
+        .env("GIT_WS_TEST_TARGET", &target_dir)
+        .output()
+        .expect("run fish");
+
+    assert!(
+        output.status.success(),
+        "fish wrapper failed\nstdout:\n{}\nstderr:\n{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert_eq!(
+        String::from_utf8_lossy(&output.stdout).trim(),
+        target_dir.display().to_string()
+    );
 }
