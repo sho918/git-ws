@@ -22,7 +22,7 @@ function __git_ws_run_and_cd
 
     set -l target
     if test -s "$cd_file"
-        read -l target < "$cd_file"
+        read target < "$cd_file"
     end
     rm -f "$cd_file"
 
