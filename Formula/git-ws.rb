@@ -5,20 +5,20 @@ class GitWs < Formula
 
   on_macos do
     on_arm do
-      url "https://github.com/sho918/git-ws/releases/download/v0.1.0/git-ws-v0.1.0-aarch64-apple-darwin.tar.gz"
-      sha256 "e1cb09791395a9dfd9bd8309d8b9aaf44b651f4a2702889fc9820439c685eb92"
+      url "https://github.com/sho918/git-ws/releases/download/v0.1.1/git-ws-v0.1.1-aarch64-apple-darwin.tar.gz"
+      sha256 "5c96282a97bbd052d9541fc199cdbd34d71ef1eb952878c4c9aa19b07e81d7b5"
     end
 
     on_intel do
-      url "https://github.com/sho918/git-ws/releases/download/v0.1.0/git-ws-v0.1.0-x86_64-apple-darwin.tar.gz"
-      sha256 "f062f95fdd5a16c033365806c5f00b5f4c9eac53b3d320642493094c1b6a9747"
+      url "https://github.com/sho918/git-ws/releases/download/v0.1.1/git-ws-v0.1.1-x86_64-apple-darwin.tar.gz"
+      sha256 "aa9a63b447a694c9c4cd79625b29609cf97d14e1fb3b4e1ef59d0134b67b3b28"
     end
   end
 
   on_linux do
     on_intel do
-      url "https://github.com/sho918/git-ws/releases/download/v0.1.0/git-ws-v0.1.0-x86_64-unknown-linux-gnu.tar.gz"
-      sha256 "733c1c7c54290ee7a312f8ab121c3f801d107dd2454ee47009f77f4278ebd940"
+      url "https://github.com/sho918/git-ws/releases/download/v0.1.1/git-ws-v0.1.1-x86_64-unknown-linux-gnu.tar.gz"
+      sha256 "9024b4b790e75257c864b4b1f20b5709f6173bfc5dd593d0dc4fa5a8167b076e"
     end
   end
 
