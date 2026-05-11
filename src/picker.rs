@@ -8,13 +8,14 @@ use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{Cell, Paragraph, Row, Table, TableState, Wrap};
 
-use crate::candidates::Candidate;
+use crate::candidates::{Candidate, TrackingState};
 use crate::tui::{
-    self, HIGHLIGHT_SYMBOL, NavCommand, Outcome, TuiTerminal, header_style, label_line, panel,
-    row_highlight_style,
+    self, HIGHLIGHT_SYMBOL, NavCommand, Outcome, Tone, TuiTerminal, header_style, label_line,
+    panel, row_highlight_style, tone_style,
 };
 
 const VISIBLE_ROWS: usize = 15;
+const BASE_DETAIL_HEIGHT: u16 = 5;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct PickerEntry<T> {
@@ -22,6 +23,8 @@ pub struct PickerEntry<T> {
     pub marker: String,
     pub name: String,
     pub detail: String,
+    pub extra_columns: Vec<String>,
+    pub tones: Vec<Tone>,
     pub action: String,
     pub search_text: String,
 }
@@ -32,7 +35,25 @@ pub struct PickerView<'a> {
     pub marker_header: &'a str,
     pub name_header: &'a str,
     pub detail_header: &'a str,
+    pub extra_headers: &'a [&'a str],
+    pub widths: &'a [Constraint],
 }
+
+pub const DEFAULT_PICKER_WIDTHS: &[Constraint] = &[
+    Constraint::Length(12),
+    Constraint::Percentage(44),
+    Constraint::Min(20),
+];
+
+const CANDIDATE_PICKER_WIDTHS: &[Constraint] = &[
+    Constraint::Length(12),
+    Constraint::Percentage(28),
+    Constraint::Percentage(16),
+    Constraint::Length(16),
+    Constraint::Length(11),
+    Constraint::Min(18),
+    Constraint::Min(18),
+];
 
 pub fn pick_candidate(
     candidates: &[Candidate],
@@ -50,7 +71,9 @@ pub fn pick_candidate(
             prompt: "git ws>",
             marker_header: "Avail",
             name_header: "Name",
-            detail_header: "Detail",
+            detail_header: "Upstream",
+            extra_headers: &["Track", "Head", "Path", "Action"],
+            widths: CANDIDATE_PICKER_WIDTHS,
         },
     )
 }
@@ -280,12 +303,14 @@ fn render_picker<T>(
     view: PickerView<'_>,
 ) {
     let area = frame.area();
+    let detail_height = BASE_DETAIL_HEIGHT
+        .saturating_add(u16::try_from(view.extra_headers.len()).unwrap_or(u16::MAX));
     let chunks = Layout::default()
         .direction(Direction::Vertical)
         .constraints([
             Constraint::Length(3),
             Constraint::Min(6),
-            Constraint::Length(5),
+            Constraint::Length(detail_height),
             Constraint::Length(1),
         ])
         .split(area);
@@ -306,31 +331,24 @@ fn render_picker<T>(
             chunks[1],
         );
     } else {
-        let header = Row::new([
-            Cell::from(view.marker_header),
-            Cell::from(view.name_header),
-            Cell::from(view.detail_header),
-        ])
+        let header = Row::new(
+            [view.marker_header, view.name_header, view.detail_header]
+                .into_iter()
+                .chain(view.extra_headers.iter().copied())
+                .map(Cell::from),
+        )
         .style(header_style());
         let rows = ranked.iter().map(|entry| {
-            Row::new([
-                Cell::from(entry.marker.as_str()),
-                Cell::from(entry.name.as_str()),
-                Cell::from(entry.detail.as_str()),
-            ])
+            Row::new(entry.display_columns().enumerate().map(|(index, value)| {
+                let tone = entry.tones.get(index).copied().unwrap_or(Tone::Default);
+                Cell::from(value).style(tone_style(tone))
+            }))
         });
-        let table = Table::new(
-            rows,
-            [
-                Constraint::Length(12),
-                Constraint::Percentage(44),
-                Constraint::Min(20),
-            ],
-        )
-        .header(header)
-        .block(panel(" candidates "))
-        .row_highlight_style(row_highlight_style())
-        .highlight_symbol(HIGHLIGHT_SYMBOL);
+        let table = Table::new(rows, view.widths.iter().copied())
+            .header(header)
+            .block(panel(" candidates "))
+            .row_highlight_style(row_highlight_style())
+            .highlight_symbol(HIGHLIGHT_SYMBOL);
         let scroll_offset = state
             .selected
             .saturating_sub(VISIBLE_ROWS.saturating_sub(1));
@@ -342,14 +360,21 @@ fn render_picker<T>(
     let detail = ranked
         .get(state.selected)
         .map(|entry| {
-            vec![
+            let mut lines = vec![
                 Line::from(vec![
                     Span::styled("Selected ", Style::default().fg(Color::DarkGray)),
                     Span::styled(&entry.name, Style::default().fg(Color::White)),
                 ]),
                 label_line("Detail   ", &entry.detail),
                 label_line("Action   ", &entry.action),
-            ]
+            ];
+            for (header, value) in view.extra_headers.iter().zip(entry.extra_columns.iter()) {
+                lines.push(Line::from(vec![
+                    Span::styled(format!("{header:<9}"), Style::default().fg(Color::DarkGray)),
+                    Span::raw(value.clone()),
+                ]));
+            }
+            lines
         })
         .unwrap_or_else(|| vec![Line::from("No selectable candidate")]);
     frame.render_widget(
@@ -368,26 +393,80 @@ fn render_picker<T>(
 
 fn candidate_entry(candidate: Candidate) -> PickerEntry<Candidate> {
     let name = candidate.name.clone();
-    let detail = candidate.detail();
+    let marker = candidate.availability_label();
+    let upstream = candidate.upstream_label().to_string();
+    let track = candidate.tracking.summary.clone();
+    let head = candidate.head_label().to_string();
+    let path = candidate.path_label();
+    let action = candidate.action_label();
+    let availability = availability_tone(&candidate);
+    let up_tone = upstream_tone(&candidate);
+    let track_tone = tracking_tone(&candidate.tracking.state);
+    let path_tone = if candidate.worktree_path.is_some() {
+        Tone::Worktree
+    } else {
+        Tone::Dim
+    };
+    let search_text = format!("{name} {upstream} {track} {head} {path}");
     PickerEntry {
-        marker: candidate.availability_label(),
-        detail: detail.clone(),
-        action: action_label(&candidate),
-        search_text: format!("{name} {detail}"),
+        marker,
+        detail: upstream,
+        extra_columns: vec![track, head, path, action.clone()],
+        tones: vec![
+            availability,
+            Tone::Default,
+            up_tone,
+            track_tone,
+            Tone::Dim,
+            path_tone,
+            Tone::Info,
+        ],
+        action,
+        search_text,
         name,
         value: candidate,
     }
 }
 
-fn action_label(candidate: &Candidate) -> String {
-    if let Some(path) = &candidate.worktree_path {
-        format!("cd {}", path.display())
-    } else if let Some(local) = &candidate.local_ref {
-        format!("git switch {local}")
-    } else if let Some(remote) = &candidate.remote_ref {
-        format!("git switch -c {} --track {remote}", candidate.name)
+impl<T> PickerEntry<T> {
+    fn display_columns(&self) -> impl Iterator<Item = &str> {
+        [
+            self.marker.as_str(),
+            self.name.as_str(),
+            self.detail.as_str(),
+        ]
+        .into_iter()
+        .chain(self.extra_columns.iter().map(String::as_str))
+    }
+}
+
+fn availability_tone(candidate: &Candidate) -> Tone {
+    if candidate.worktree_path.is_some() {
+        Tone::Worktree
+    } else if candidate.local_ref.is_some() {
+        Tone::Local
+    } else if candidate.remote_ref.is_some() {
+        Tone::Remote
     } else {
-        "unavailable".to_string()
+        Tone::Dim
+    }
+}
+
+fn upstream_tone(candidate: &Candidate) -> Tone {
+    if candidate.upstream.is_some() || candidate.remote_ref.is_some() {
+        Tone::Remote
+    } else {
+        Tone::Dim
+    }
+}
+
+fn tracking_tone(state: &TrackingState) -> Tone {
+    match state {
+        TrackingState::InSync => Tone::Dim,
+        TrackingState::Ahead => Tone::Info,
+        TrackingState::Behind | TrackingState::Diverged => Tone::Behind,
+        TrackingState::Gone => Tone::Bad,
+        TrackingState::NoUpstream => Tone::Dim,
     }
 }
 
@@ -460,6 +539,8 @@ mod tests {
                 marker: "#1".to_string(),
                 name: "feat: add git-ws CLI".to_string(),
                 detail: "feat/implement-git-ws-cli".to_string(),
+                extra_columns: vec![],
+                tones: vec![],
                 action: "create worktree for PR #1".to_string(),
                 search_text: "#1 feat: add git-ws CLI feat/implement-git-ws-cli".to_string(),
             },
@@ -468,6 +549,8 @@ mod tests {
                 marker: "#2".to_string(),
                 name: "fix: cleanup default branch".to_string(),
                 detail: "fix/cleanup-default".to_string(),
+                extra_columns: vec![],
+                tones: vec![],
                 action: "create worktree for PR #2".to_string(),
                 search_text: "#2 fix cleanup default branch fix/cleanup-default".to_string(),
             },
@@ -477,7 +560,7 @@ mod tests {
             query: "git".to_string(),
             selected: 0,
         };
-        let mut terminal = Terminal::new(TestBackend::new(88, 18)).expect("terminal");
+        let mut terminal = Terminal::new(TestBackend::new(140, 18)).expect("terminal");
 
         terminal
             .draw(|frame| {
@@ -490,12 +573,68 @@ mod tests {
                         marker_header: "PR",
                         name_header: "Title",
                         detail_header: "Head",
+                        extra_headers: &[],
+                        widths: DEFAULT_PICKER_WIDTHS,
                     },
                 );
             })
             .expect("draw");
 
         assert_snapshot!(terminal.backend());
+    }
+
+    #[test]
+    fn render_picker_expands_detail_panel_for_extra_metadata() {
+        let entries = [PickerEntry {
+            value: "1",
+            marker: "#1".to_string(),
+            name: "fix: show metadata".to_string(),
+            detail: "mona".to_string(),
+            extra_columns: vec![
+                "ui, picker".to_string(),
+                "2026-05-12".to_string(),
+                "milestone-1".to_string(),
+            ],
+            tones: vec![],
+            action: "create worktree for issue #1".to_string(),
+            search_text: "#1 fix show metadata mona ui picker 2026-05-12".to_string(),
+        }];
+        let ranked: Vec<_> = entries.iter().collect();
+        let state = PickerState {
+            query: String::new(),
+            selected: 0,
+        };
+        let mut terminal = Terminal::new(TestBackend::new(120, 20)).expect("terminal");
+
+        terminal
+            .draw(|frame| {
+                render_picker(
+                    frame,
+                    &state,
+                    &ranked,
+                    PickerView {
+                        prompt: "git ws issue>",
+                        marker_header: "Issue",
+                        name_header: "Title",
+                        detail_header: "Author",
+                        extra_headers: &["Labels", "Updated", "Planned"],
+                        widths: &[
+                            Constraint::Length(12),
+                            Constraint::Percentage(28),
+                            Constraint::Percentage(16),
+                            Constraint::Length(18),
+                            Constraint::Length(11),
+                            Constraint::Min(18),
+                        ],
+                    },
+                );
+            })
+            .expect("draw");
+
+        let screen = format!("{:?}", terminal.backend());
+        assert!(screen.contains("Labels   ui, picker"), "{screen}");
+        assert!(screen.contains("Updated  2026-05-12"), "{screen}");
+        assert!(screen.contains("Planned  milestone-1"), "{screen}");
     }
 
     #[test]
@@ -506,6 +645,8 @@ mod tests {
                 marker: format!("#{number}"),
                 name: format!("candidate-{number:02}"),
                 detail: format!("branch-{number:02}"),
+                extra_columns: vec![],
+                tones: vec![],
                 action: format!("create worktree {number:02}"),
                 search_text: format!("candidate-{number:02} branch-{number:02}"),
             })
@@ -528,6 +669,8 @@ mod tests {
                         marker_header: "PR",
                         name_header: "Title",
                         detail_header: "Head",
+                        extra_headers: &[],
+                        widths: DEFAULT_PICKER_WIDTHS,
                     },
                 );
             })

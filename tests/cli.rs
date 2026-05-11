@@ -56,6 +56,29 @@ fn list_outputs_remote_branch_json() {
 }
 
 #[test]
+fn list_json_reports_tracking_and_action() {
+    let repo = TestRepo::with_remote();
+    repo.create_remote_branch("feature/tracking-json");
+    git(repo.path(), ["switch", "feature/tracking-json"]);
+    std::fs::write(repo.path().join("local-ahead.txt"), "ahead\n").expect("write ahead file");
+    git(repo.path(), ["add", "local-ahead.txt"]);
+    git(repo.path(), ["commit", "-m", "local ahead"]);
+    git(repo.path(), ["switch", "main"]);
+
+    let output = command_output(repo.path(), ["list", "--json"]);
+
+    assert_success(&output);
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(stdout.contains("\"tracking\""), "{stdout}");
+    assert!(stdout.contains("\"state\": \"ahead\""), "{stdout}");
+    assert!(stdout.contains("\"summary\": \"ahead 1\""), "{stdout}");
+    assert!(
+        stdout.contains("\"action\": \"git switch feature/tracking-json\""),
+        "{stdout}"
+    );
+}
+
+#[test]
 fn list_type_worktree_omits_prunable_missing_worktree() {
     let repo = TestRepo::with_remote();
     let create = command_output(
@@ -1345,6 +1368,9 @@ fn cleanup_json_reports_unmerged_gone_branch_as_skipped() {
     let stdout = String::from_utf8_lossy(&output.stdout);
     assert!(stdout.contains("feature/gone"));
     assert!(stdout.contains("SkipUnmerged"));
+    assert!(stdout.contains("\"eligible\": false"));
+    assert!(stdout.contains("\"requiresForce\": true"));
+    assert!(stdout.contains("\"action\": \"skip\""));
 }
 
 #[test]

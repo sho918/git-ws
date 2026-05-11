@@ -4,10 +4,12 @@ use std::process::Command;
 #[cfg(unix)]
 use std::os::unix::fs::PermissionsExt;
 
-use git_ws::candidates::{Candidate, CandidateFilter, merge_candidates};
+use git_ws::candidates::{
+    Candidate, CandidateFilter, TrackingInfo, TrackingState, merge_candidates,
+};
 use git_ws::cleanup::{CleanupDisposition, CleanupInput, classify_cleanup_candidate};
 use git_ws::config::{FileConfig, GitConfig, load_file_config, resolve_base_dir};
-use git_ws::git::{Worktree, parse_worktree_porcelain};
+use git_ws::git::{LocalBranch, Worktree, parse_worktree_porcelain};
 use git_ws::github::{
     IssueListItem, PullRequestListItem, issue_picker_entries, pr_picker_entries, slugify_title,
 };
@@ -99,11 +101,12 @@ fn merges_worktree_local_and_remote_candidates_by_branch_name() {
             branch: Some("feature/demo".to_string()),
             is_main: false,
         }],
-        vec![(
-            "feature/demo".to_string(),
-            Some("origin/feature/demo".to_string()),
-            "abc1234".to_string(),
-        )],
+        vec![LocalBranch {
+            name: "feature/demo".to_string(),
+            upstream: Some("origin/feature/demo".to_string()),
+            track: None,
+            head: "abc1234".to_string(),
+        }],
         vec![(
             "feature/demo".to_string(),
             "origin/feature/demo".to_string(),
@@ -122,6 +125,7 @@ fn merges_worktree_local_and_remote_candidates_by_branch_name() {
             worktree_head: Some("abc1234".to_string()),
             local_head: Some("abc1234".to_string()),
             remote_head: Some("abc1234".to_string()),
+            tracking: TrackingInfo::from_git_track(None, true),
         }]
     );
 }
@@ -177,6 +181,26 @@ fn candidate_filter_accepts_documented_aliases() {
 }
 
 #[test]
+fn candidate_tracking_parses_git_track_summary() {
+    let ahead = TrackingInfo::from_git_track(Some("[ahead 2]"), true);
+    let behind = TrackingInfo::from_git_track(Some("[behind 3]"), true);
+    let diverged = TrackingInfo::from_git_track(Some("[ahead 2, behind 1]"), true);
+    let gone = TrackingInfo::from_git_track(Some("[gone]"), true);
+    let no_upstream = TrackingInfo::from_git_track(None, false);
+
+    assert_eq!(ahead.state, TrackingState::Ahead);
+    assert_eq!(ahead.summary, "ahead 2");
+    assert_eq!(behind.state, TrackingState::Behind);
+    assert_eq!(behind.summary, "behind 3");
+    assert_eq!(diverged.state, TrackingState::Diverged);
+    assert_eq!(diverged.ahead, 2);
+    assert_eq!(diverged.behind, 1);
+    assert_eq!(gone.state, TrackingState::Gone);
+    assert_eq!(gone.summary, "gone");
+    assert_eq!(no_upstream.state, TrackingState::NoUpstream);
+}
+
+#[test]
 fn candidate_display_prefers_worktree_then_upstream_then_remote() {
     let mut candidate = Candidate {
         name: "feature/demo".to_string(),
@@ -187,6 +211,7 @@ fn candidate_display_prefers_worktree_then_upstream_then_remote() {
         worktree_head: None,
         local_head: None,
         remote_head: None,
+        tracking: TrackingInfo::from_git_track(None, true),
     };
 
     assert_eq!(candidate.availability_label(), "[W][L][R]");
@@ -197,6 +222,75 @@ fn candidate_display_prefers_worktree_then_upstream_then_remote() {
 
     candidate.upstream = None;
     assert_eq!(candidate.detail(), "origin/feature/demo");
+}
+
+#[test]
+fn candidate_action_and_head_use_selected_target() {
+    let local = Candidate {
+        name: "feature/demo".to_string(),
+        worktree_path: None,
+        local_ref: Some("feature/demo".to_string()),
+        remote_ref: Some("origin/feature/demo".to_string()),
+        upstream: Some("origin/feature/demo".to_string()),
+        worktree_head: None,
+        local_head: Some("abc1234".to_string()),
+        remote_head: Some("def5678".to_string()),
+        tracking: TrackingInfo::from_git_track(Some("[ahead 1]"), true),
+    };
+    let remote = Candidate {
+        name: "feature/remote".to_string(),
+        worktree_path: None,
+        local_ref: None,
+        remote_ref: Some("origin/feature/remote".to_string()),
+        upstream: None,
+        worktree_head: None,
+        local_head: None,
+        remote_head: Some("fed9876".to_string()),
+        tracking: TrackingInfo::from_git_track(None, false),
+    };
+
+    assert_eq!(local.head_label(), "abc1234");
+    assert_eq!(local.action_label(), "git switch feature/demo");
+    assert_eq!(remote.head_label(), "fed9876");
+    assert_eq!(
+        remote.action_label(),
+        "git switch -c feature/remote --track origin/feature/remote"
+    );
+}
+
+#[test]
+fn github_picker_entries_include_metadata_columns() {
+    let issues: Vec<IssueListItem> = serde_json::from_slice(
+        br##"[{"number":42,"title":"Fix worktree cleanup","author":{"login":"octo"},"labels":[{"name":"bug"},{"name":"cli"}],"updatedAt":"2026-05-10T12:00:00Z"}]"##,
+    )
+    .expect("issue list should parse");
+    let prs: Vec<PullRequestListItem> = serde_json::from_slice(
+        br##"[{"number":7,"title":"Add PR worktree","headRefName":"feature/pr-head","baseRefName":"main","isCrossRepository":false,"isDraft":true,"reviewDecision":"REVIEW_REQUIRED","author":{"login":"mona"},"updatedAt":"2026-05-10T12:00:00Z"}]"##,
+    )
+    .expect("PR list should parse");
+
+    let issue_entry = issue_picker_entries(&issues).remove(0);
+    let pr_entry = pr_picker_entries(&prs).remove(0);
+
+    assert_eq!(issue_entry.detail, "octo");
+    assert_eq!(
+        issue_entry.extra_columns,
+        vec![
+            "bug,cli".to_string(),
+            "2026-05-10".to_string(),
+            "issue/42-fix-worktree-cleanup".to_string(),
+        ]
+    );
+    assert_eq!(pr_entry.detail, "mona");
+    assert_eq!(
+        pr_entry.extra_columns,
+        vec![
+            "feature/pr-head".to_string(),
+            "main".to_string(),
+            "draft".to_string(),
+            "2026-05-10".to_string(),
+        ]
+    );
 }
 
 #[test]
@@ -212,6 +306,8 @@ fn fuzzy_ranking_returns_matching_entries_only() {
         marker: String::new(),
         name: name.to_string(),
         detail: String::new(),
+        extra_columns: vec![],
+        tones: vec![],
         action: String::new(),
         search_text: name.to_string(),
     })
@@ -232,6 +328,8 @@ fn picker_query_without_match_returns_error() {
         marker: String::new(),
         name: "feature/worktree-cleanup".to_string(),
         detail: String::new(),
+        extra_columns: vec![],
+        tones: vec![],
         action: String::new(),
         search_text: "feature/worktree-cleanup".to_string(),
     }];
@@ -244,6 +342,8 @@ fn picker_query_without_match_returns_error() {
             marker_header: "Avail",
             name_header: "Name",
             detail_header: "Detail",
+            extra_headers: &[],
+            widths: git_ws::picker::DEFAULT_PICKER_WIDTHS,
         },
     )
     .unwrap_err();
@@ -266,6 +366,7 @@ fn candidate_query_with_duplicate_remote_branch_is_ambiguous() {
             worktree_head: None,
             local_head: None,
             remote_head: Some("abc1234".to_string()),
+            tracking: TrackingInfo::from_git_track(None, false),
         },
         Candidate {
             name: "feature/shared".to_string(),
@@ -276,6 +377,7 @@ fn candidate_query_with_duplicate_remote_branch_is_ambiguous() {
             worktree_head: None,
             local_head: None,
             remote_head: Some("def5678".to_string()),
+            tracking: TrackingInfo::from_git_track(None, false),
         },
     ];
 
@@ -299,6 +401,7 @@ fn candidate_query_prefers_local_match_over_duplicate_remote_ambiguity() {
             worktree_head: None,
             local_head: Some("abc1234".to_string()),
             remote_head: None,
+            tracking: TrackingInfo::from_git_track(None, false),
         },
         Candidate {
             name: "feature/shared".to_string(),
@@ -309,6 +412,7 @@ fn candidate_query_prefers_local_match_over_duplicate_remote_ambiguity() {
             worktree_head: None,
             local_head: None,
             remote_head: Some("def5678".to_string()),
+            tracking: TrackingInfo::from_git_track(None, false),
         },
         Candidate {
             name: "feature/shared".to_string(),
@@ -319,6 +423,7 @@ fn candidate_query_prefers_local_match_over_duplicate_remote_ambiguity() {
             worktree_head: None,
             local_head: None,
             remote_head: Some("fed9876".to_string()),
+            tracking: TrackingInfo::from_git_track(None, false),
         },
     ];
 
@@ -337,6 +442,8 @@ fn picker_entries_match_search_text_beyond_display_name() {
             marker: "#7".to_string(),
             name: "Add PR worktree".to_string(),
             detail: "feature/pr-head".to_string(),
+            extra_columns: vec![],
+            tones: vec![],
             action: "create PR worktree".to_string(),
             search_text: "#7 Add PR worktree feature/pr-head".to_string(),
         },
@@ -345,6 +452,8 @@ fn picker_entries_match_search_text_beyond_display_name() {
             marker: "#8".to_string(),
             name: "Fix cleanup".to_string(),
             detail: "feature/cleanup".to_string(),
+            extra_columns: vec![],
+            tones: vec![],
             action: "create PR worktree".to_string(),
             search_text: "#8 Fix cleanup feature/cleanup".to_string(),
         },
@@ -366,6 +475,9 @@ fn parses_github_issue_list_and_builds_picker_entries() {
         vec![IssueListItem {
             number: 42,
             title: "Fix worktree cleanup".to_string(),
+            author: None,
+            labels: vec![],
+            updated_at: None,
         }]
     );
 
@@ -389,6 +501,11 @@ fn parses_github_pr_list_and_builds_picker_entries() {
             title: "Add PR worktree".to_string(),
             head_ref_name: "feature/pr-head".to_string(),
             is_cross_repository: false,
+            author: None,
+            base_ref_name: None,
+            is_draft: false,
+            review_decision: None,
+            updated_at: None,
         }]
     );
 

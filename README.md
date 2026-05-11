@@ -60,6 +60,26 @@ interactive fuzzy picker. To pick only remote branches, use:
 git ws open --type remote
 ```
 
+Interactive and TTY table views show dense columns for the selected workflow:
+
+- `git ws` and `git ws list`: status, branch name, upstream, tracking state,
+  head, path, and action.
+- `git ws issue`: number, title, author, labels, updated date, and planned
+  branch.
+- `git ws pr`: number, title, author, head, base, review state, and updated
+  date.
+- `git ws cleanup`: deletion selection, branch, disposition, reasons, path, and
+  action.
+
+TTY views use color as a secondary signal: worktrees are green, local branches
+yellow, remote refs cyan, stale or blocked states red, behind/diverged states
+magenta, and ahead states blue. Non-TTY output and JSON never include ANSI color
+codes.
+
+`git ws list --json` keeps the existing fields and adds `tracking` and `action`.
+`git ws cleanup --json` keeps the existing fields and adds `reasons`,
+`eligible`, `requiresForce`, and `action`.
+
 ## Repository Config
 
 Create `.git-ws.toml` at the repository root:

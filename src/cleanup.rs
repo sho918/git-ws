@@ -19,8 +19,8 @@ use crate::git::{
 };
 use crate::path_to_str;
 use crate::tui::{
-    self, HIGHLIGHT_SYMBOL, NavCommand, Outcome, TuiTerminal, header_style, label_line, panel,
-    row_highlight_style,
+    self, HIGHLIGHT_SYMBOL, NavCommand, Outcome, Tone, TuiTerminal, header_style, label_line,
+    panel, row_highlight_style, tone_style,
 };
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -41,6 +41,18 @@ pub enum CleanupDisposition {
     SkipMain,
     SkipDirty,
     SkipUnmerged,
+}
+
+impl CleanupDisposition {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            CleanupDisposition::SafeDelete => "SafeDelete",
+            CleanupDisposition::SkipCurrent => "SkipCurrent",
+            CleanupDisposition::SkipMain => "SkipMain",
+            CleanupDisposition::SkipDirty => "SkipDirty",
+            CleanupDisposition::SkipUnmerged => "SkipUnmerged",
+        }
+    }
 }
 
 pub fn classify_cleanup_candidate(input: &CleanupInput) -> CleanupDisposition {
@@ -72,7 +84,7 @@ pub fn run_cleanup(options: CleanupOptions) -> Result<()> {
     let candidates = discover_cleanup_candidates()?;
 
     if options.json {
-        print_cleanup_json(&candidates)?;
+        print_cleanup_json(&candidates, options.force)?;
         return Ok(());
     }
 
@@ -87,15 +99,15 @@ pub fn run_cleanup(options: CleanupOptions) -> Result<()> {
     }
 
     if options.dry_run {
-        print_cleanup_candidates(&safe);
+        print_cleanup_candidates(&safe, options.force);
         return Ok(());
     }
 
     let selected = if options.yes {
-        print_cleanup_candidates(&safe);
+        print_cleanup_candidates(&safe, options.force);
         (0..safe.len()).collect()
     } else {
-        prompt_cleanup_selection(&safe)?
+        prompt_cleanup_selection(&safe, options.force)?
     };
 
     delete_cleanup_candidates_with(&safe, &selected, options.force, delete_cleanup_candidate)
@@ -117,10 +129,13 @@ where
 }
 
 fn should_cleanup_candidate(input: &CleanupInput, force: bool) -> bool {
-    match classify_cleanup_candidate(input) {
+    eligible_for(classify_cleanup_candidate(input), input, force)
+}
+
+fn eligible_for(disposition: CleanupDisposition, input: &CleanupInput, force: bool) -> bool {
+    match disposition {
         CleanupDisposition::SafeDelete => true,
-        CleanupDisposition::SkipCurrent => false,
-        CleanupDisposition::SkipMain => false,
+        CleanupDisposition::SkipCurrent | CleanupDisposition::SkipMain => false,
         CleanupDisposition::SkipDirty => force && is_stale_or_merged(input),
         CleanupDisposition::SkipUnmerged => force && input.upstream_gone,
     }
@@ -275,44 +290,68 @@ fn worktree_clean(path: &Path) -> Result<bool> {
     Ok(bytes.is_empty())
 }
 
-fn print_cleanup_candidates(inputs: &[&CleanupInput]) {
+fn print_cleanup_candidates(inputs: &[&CleanupInput], force: bool) {
     if io::stdout().is_terminal() {
         println!("git-ws cleanup candidates");
-        println!("{:<4} {:<40} {:<18} Path", "No", "Branch", "Reason");
-        println!("{:-<4} {:-<40} {:-<18} {:-<1}", "", "", "", "");
+        println!(
+            "{:<4} {:<34} {:<16} {:<18} {:<28} Action",
+            "No", "Branch", "Disposition", "Reasons", "Path"
+        );
+        println!(
+            "{:-<4} {:-<34} {:-<16} {:-<18} {:-<28} {:-<1}",
+            "", "", "", "", "", ""
+        );
         for (index, input) in inputs.iter().enumerate() {
+            let disposition = classify_cleanup_candidate(input);
+            let tone = tone_for(disposition, requires_force_for(disposition, input));
             println!(
-                "{:<4} {:<40} {:<18} {}",
+                "{:<4} {:<34} {} {:<18} {:<28} {}",
                 index + 1,
                 input.branch,
+                color_disposition(disposition, tone, 16),
                 cleanup_reason(input),
-                cleanup_path(input)
+                cleanup_path(input),
+                cleanup_action(input, force)
             );
         }
     } else {
         println!("git-ws: cleanup candidates");
         for (index, input) in inputs.iter().enumerate() {
-            println!("  {}. {} {}", index + 1, input.branch, cleanup_path(input));
+            println!(
+                "  {}. {}\t{}\t{}\t{}",
+                index + 1,
+                input.branch,
+                classify_cleanup_candidate(input).as_str(),
+                cleanup_reason(input),
+                cleanup_action(input, force)
+            );
         }
     }
 }
 
 fn cleanup_reason(input: &CleanupInput) -> String {
-    let mut values = Vec::new();
-    if input.upstream_gone {
-        values.push("gone");
-    }
-    if input.merged_to_default {
-        values.push("merged");
-    }
-    if input.is_dirty {
-        values.push("dirty");
-    }
+    let values = cleanup_reasons(input);
     if values.is_empty() {
         "-".to_string()
     } else {
         values.join(",")
     }
+}
+
+fn cleanup_reasons(input: &CleanupInput) -> Vec<&'static str> {
+    let mut values = Vec::new();
+    if input.upstream_gone {
+        values.push("gone");
+    }
+    values.push(if input.merged_to_default {
+        "merged"
+    } else {
+        "unmerged"
+    });
+    if input.is_dirty {
+        values.push("dirty");
+    }
+    values
 }
 
 fn cleanup_path(input: &CleanupInput) -> String {
@@ -323,15 +362,15 @@ fn cleanup_path(input: &CleanupInput) -> String {
         .unwrap_or_else(|| "-".to_string())
 }
 
-fn prompt_cleanup_selection(inputs: &[&CleanupInput]) -> Result<Vec<usize>> {
+fn prompt_cleanup_selection(inputs: &[&CleanupInput], force: bool) -> Result<Vec<usize>> {
     if !io::stdin().is_terminal() {
         return Err(anyhow!("cleanup requires --yes in non-interactive mode"));
     }
     if tui::is_interactive() {
-        return run_cleanup_selector(inputs);
+        return run_cleanup_selector(inputs, force);
     }
 
-    print_cleanup_candidates(inputs);
+    print_cleanup_candidates(inputs, force);
     prompt_cleanup_selection_text(inputs.len())
 }
 
@@ -360,9 +399,9 @@ fn prompt_cleanup_selection_text(max: usize) -> Result<Vec<usize>> {
     Ok(selected)
 }
 
-fn run_cleanup_selector(inputs: &[&CleanupInput]) -> Result<Vec<usize>> {
+fn run_cleanup_selector(inputs: &[&CleanupInput], force: bool) -> Result<Vec<usize>> {
     let mut terminal = TuiTerminal::new()?;
-    let mut state = CleanupSelectorState::new(inputs);
+    let mut state = CleanupSelectorState::new(inputs, force);
 
     loop {
         if !event::poll(std::time::Duration::ZERO).unwrap_or(false) {
@@ -393,8 +432,11 @@ fn run_cleanup_selector(inputs: &[&CleanupInput]) -> Result<Vec<usize>> {
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct CleanupRow {
     branch: String,
+    disposition: &'static str,
     reason: String,
     path: String,
+    action: String,
+    tone: Tone,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -405,13 +447,20 @@ struct CleanupSelectorState {
 }
 
 impl CleanupSelectorState {
-    fn new(inputs: &[&CleanupInput]) -> Self {
+    fn new(inputs: &[&CleanupInput], force: bool) -> Self {
         let rows: Vec<CleanupRow> = inputs
             .iter()
-            .map(|input| CleanupRow {
-                branch: input.branch.clone(),
-                reason: cleanup_reason(input),
-                path: cleanup_path(input),
+            .map(|input| {
+                let disposition = classify_cleanup_candidate(input);
+                let requires_force = requires_force_for(disposition, input);
+                CleanupRow {
+                    branch: input.branch.clone(),
+                    disposition: disposition.as_str(),
+                    reason: cleanup_reason(input),
+                    path: cleanup_path(input),
+                    action: cleanup_action(input, force),
+                    tone: tone_for(disposition, requires_force),
+                }
             })
             .collect();
         Self {
@@ -503,7 +552,7 @@ fn render_cleanup_selector(frame: &mut Frame<'_>, state: &CleanupSelectorState) 
         .constraints([
             Constraint::Length(3),
             Constraint::Min(8),
-            Constraint::Length(4),
+            Constraint::Length(7),
             Constraint::Length(1),
         ])
         .split(area);
@@ -521,8 +570,10 @@ fn render_cleanup_selector(frame: &mut Frame<'_>, state: &CleanupSelectorState) 
     let header = Row::new([
         Cell::from("Del"),
         Cell::from("Branch"),
-        Cell::from("Reason"),
+        Cell::from("Disposition"),
+        Cell::from("Reasons"),
         Cell::from("Path"),
+        Cell::from("Action"),
     ])
     .style(header_style());
     let rows = state.rows.iter().enumerate().map(|(index, row)| {
@@ -533,18 +584,26 @@ fn render_cleanup_selector(frame: &mut Frame<'_>, state: &CleanupSelectorState) 
         };
         Row::new([
             Cell::from(checkbox),
-            Cell::from(row.branch.as_str()),
-            Cell::from(row.reason.as_str()),
-            Cell::from(row.path.as_str()),
+            Cell::from(row.branch.as_str()).style(tone_style(row.tone)),
+            Cell::from(row.disposition).style(tone_style(row.tone)),
+            Cell::from(row.reason.as_str()).style(tone_style(row.tone)),
+            Cell::from(row.path.as_str()).style(tone_style(if row.path == "-" {
+                Tone::Dim
+            } else {
+                Tone::Worktree
+            })),
+            Cell::from(row.action.as_str()).style(tone_style(Tone::Info)),
         ])
     });
     let table = Table::new(
         rows,
         [
             Constraint::Length(5),
-            Constraint::Percentage(36),
+            Constraint::Percentage(27),
+            Constraint::Length(16),
             Constraint::Length(18),
-            Constraint::Min(20),
+            Constraint::Percentage(24),
+            Constraint::Min(18),
         ],
     )
     .header(header)
@@ -561,7 +620,10 @@ fn render_cleanup_selector(frame: &mut Frame<'_>, state: &CleanupSelectorState) 
         .map(|row| {
             vec![
                 label_line("Branch  ", row.branch.as_str()),
+                label_line("State   ", row.disposition),
                 label_line("Reason  ", row.reason.as_str()),
+                label_line("Path    ", row.path.as_str()),
+                label_line("Action  ", row.action.as_str()),
             ]
         })
         .unwrap_or_else(|| vec![Line::from("No candidate")]);
@@ -608,24 +670,87 @@ struct CleanupRecord<'a> {
     current: bool,
     #[serde(rename = "mainWorktree")]
     main_worktree: bool,
+    reasons: Vec<&'static str>,
+    eligible: bool,
+    #[serde(rename = "requiresForce")]
+    requires_force: bool,
+    action: String,
 }
 
-fn print_cleanup_json(inputs: &[CleanupInput]) -> Result<()> {
+fn print_cleanup_json(inputs: &[CleanupInput], force: bool) -> Result<()> {
     let values: Vec<CleanupRecord> = inputs
         .iter()
-        .map(|input| CleanupRecord {
-            branch: input.branch.as_str(),
-            worktree_path: input.worktree_path.as_deref(),
-            disposition: classify_cleanup_candidate(input),
-            upstream_gone: input.upstream_gone,
-            merged_to_default: input.merged_to_default,
-            dirty: input.is_dirty,
-            current: input.is_current_worktree,
-            main_worktree: input.is_main_worktree,
+        .map(|input| {
+            let disposition = classify_cleanup_candidate(input);
+            let eligible_no_force = eligible_for(disposition, input, false);
+            let eligible_with_force = eligible_for(disposition, input, true);
+            let eligible = if force {
+                eligible_with_force
+            } else {
+                eligible_no_force
+            };
+            CleanupRecord {
+                branch: input.branch.as_str(),
+                worktree_path: input.worktree_path.as_deref(),
+                disposition,
+                upstream_gone: input.upstream_gone,
+                merged_to_default: input.merged_to_default,
+                dirty: input.is_dirty,
+                current: input.is_current_worktree,
+                main_worktree: input.is_main_worktree,
+                reasons: cleanup_reasons(input),
+                eligible,
+                requires_force: !eligible_no_force && eligible_with_force,
+                action: if eligible {
+                    cleanup_action(input, force)
+                } else {
+                    "skip".to_string()
+                },
+            }
         })
         .collect();
     println!("{}", serde_json::to_string_pretty(&values)?);
     Ok(())
+}
+
+fn requires_force_for(disposition: CleanupDisposition, input: &CleanupInput) -> bool {
+    !eligible_for(disposition, input, false) && eligible_for(disposition, input, true)
+}
+
+fn cleanup_action(input: &CleanupInput, force: bool) -> String {
+    let branch_delete = format!("git branch -D {}", input.branch);
+    if let Some(path) = &input.worktree_path {
+        let remove = if force {
+            format!("git worktree remove --force {}", path.display())
+        } else {
+            format!("git worktree remove {}", path.display())
+        };
+        format!("{remove} && {branch_delete}")
+    } else {
+        branch_delete
+    }
+}
+
+fn tone_for(disposition: CleanupDisposition, requires_force: bool) -> Tone {
+    match disposition {
+        CleanupDisposition::SafeDelete => Tone::Good,
+        CleanupDisposition::SkipDirty => Tone::Dirty,
+        CleanupDisposition::SkipUnmerged if requires_force => Tone::Warning,
+        CleanupDisposition::SkipCurrent
+        | CleanupDisposition::SkipMain
+        | CleanupDisposition::SkipUnmerged => Tone::Bad,
+    }
+}
+
+fn color_disposition(disposition: CleanupDisposition, tone: Tone, width: usize) -> String {
+    let code = match tone {
+        Tone::Good => 32,
+        Tone::Warning => 33,
+        Tone::Dirty => 35,
+        Tone::Bad => 31,
+        _ => 2,
+    };
+    format!("\x1b[{code}m{:<width$}\x1b[0m", disposition.as_str())
 }
 
 #[cfg(test)]
@@ -641,7 +766,7 @@ mod tests {
     fn cleanup_selector_toggles_one_and_all_candidates() {
         let inputs = sample_inputs(3);
         let input_refs: Vec<_> = inputs.iter().collect();
-        let mut state = CleanupSelectorState::new(&input_refs);
+        let mut state = CleanupSelectorState::new(&input_refs, false);
 
         assert_eq!(state.apply(CleanupCommand::Toggle), Outcome::Continue);
         assert_eq!(state.apply(CleanupCommand::Down), Outcome::Continue);
@@ -709,9 +834,9 @@ mod tests {
             },
         ];
         let input_refs: Vec<_> = inputs.iter().collect();
-        let mut state = CleanupSelectorState::new(&input_refs);
+        let mut state = CleanupSelectorState::new(&input_refs, false);
         state.apply(CleanupCommand::Toggle);
-        let mut terminal = Terminal::new(TestBackend::new(96, 18)).expect("terminal");
+        let mut terminal = Terminal::new(TestBackend::new(150, 20)).expect("terminal");
 
         terminal
             .draw(|frame| render_cleanup_selector(frame, &state))

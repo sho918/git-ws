@@ -20,6 +20,14 @@ pub struct Repo {
     pub root: PathBuf,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct LocalBranch {
+    pub name: String,
+    pub upstream: Option<String>,
+    pub track: Option<String>,
+    pub head: String,
+}
+
 pub fn ensure_repo() -> Result<Repo> {
     let root = git_output(["rev-parse", "--show-toplevel"])?;
     Ok(Repo {
@@ -158,10 +166,10 @@ impl PartialWorktree {
     }
 }
 
-pub fn list_local_branches() -> Result<Vec<(String, Option<String>, String)>> {
+pub fn list_local_branches() -> Result<Vec<LocalBranch>> {
     let output = git_output([
         "for-each-ref",
-        "--format=%(refname)%09%(upstream:short)%09%(objectname:short)",
+        "--format=%(refname)%09%(upstream:short)%09%(upstream:track)%09%(objectname:short)",
         "refs/heads",
     ])?;
     Ok(output
@@ -173,8 +181,17 @@ pub fn list_local_branches() -> Result<Vec<(String, Option<String>, String)>> {
                 .next()
                 .filter(|value| !value.is_empty())
                 .map(ToString::to_string);
+            let track = parts
+                .next()
+                .filter(|value| !value.is_empty())
+                .map(ToString::to_string);
             let head = parts.next().unwrap_or_default().to_string();
-            Some((branch, upstream, head))
+            Some(LocalBranch {
+                name: branch,
+                upstream,
+                track,
+                head,
+            })
         })
         .collect())
 }

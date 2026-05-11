@@ -17,6 +17,21 @@ use ratatui::{Frame, Terminal};
 pub(crate) const HIGHLIGHT_SYMBOL: &str = "› ";
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Tone {
+    Default,
+    Dim,
+    Worktree,
+    Local,
+    Remote,
+    Good,
+    Warning,
+    Bad,
+    Info,
+    Behind,
+    Dirty,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum Outcome {
     Continue,
     Submit,
@@ -71,6 +86,18 @@ pub(crate) fn row_highlight_style() -> Style {
         .fg(Color::Black)
         .bg(Color::Cyan)
         .add_modifier(Modifier::BOLD)
+}
+
+pub(crate) fn tone_style(tone: Tone) -> Style {
+    match tone {
+        Tone::Default => Style::default(),
+        Tone::Dim => Style::default().fg(Color::DarkGray),
+        Tone::Worktree | Tone::Good => Style::default().fg(Color::Green),
+        Tone::Local | Tone::Warning => Style::default().fg(Color::Yellow),
+        Tone::Remote | Tone::Info => Style::default().fg(Color::Cyan),
+        Tone::Bad => Style::default().fg(Color::Red),
+        Tone::Behind | Tone::Dirty => Style::default().fg(Color::Magenta),
+    }
 }
 
 pub(crate) fn label_line<'a>(label: &'a str, value: &'a str) -> Line<'a> {
