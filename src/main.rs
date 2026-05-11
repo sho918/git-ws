@@ -4,7 +4,7 @@ use std::io::{self, IsTerminal};
 use std::path::PathBuf;
 
 use anyhow::{Result, anyhow};
-use git_ws::candidates::{Candidate, CandidateFilter, load_candidates};
+use git_ws::candidates::{Candidate, CandidateFilter, TrackingState, load_candidates};
 use git_ws::cleanup::{CleanupOptions, run_cleanup};
 use git_ws::git::{
     branch_exists, current_branch, default_branch, emit_cd_path, git_status, local_branch_name,
@@ -18,6 +18,7 @@ use git_ws::picker::{PickerView, pick_candidate, pick_entry};
 use git_ws::shell::init_script;
 use git_ws::worktree::{CreateWorktreeOptions, create_worktree, find_worktree_for_branch};
 use lexopt::prelude::*;
+use serde::Serialize;
 
 fn main() {
     if let Err(error) = run() {
@@ -115,16 +116,20 @@ fn cmd_list(args: Vec<OsString>) -> Result<()> {
     let ListArgs { filter, json } = parse_list_args(args)?;
     let candidates = load_candidates(filter)?;
     if json {
-        println!("{}", serde_json::to_string_pretty(&candidates)?);
+        print_candidates_json(&candidates)?;
     } else if io::stdout().is_terminal() {
         print_candidate_table(&candidates);
     } else {
         for candidate in candidates {
             println!(
-                "{}\t{}\t{}",
+                "{}\t{}\t{}\t{}\t{}\t{}\t{}",
                 candidate.availability_label(),
                 candidate.name,
-                candidate.detail()
+                candidate.upstream_label(),
+                candidate.tracking.summary,
+                candidate.head_label(),
+                candidate.path_label(),
+                candidate.action_label()
             );
         }
     }
@@ -176,7 +181,8 @@ fn pick_issue_id() -> Result<Option<String>> {
             prompt: "git ws issue>",
             marker_header: "Issue",
             name_header: "Title",
-            detail_header: "Detail",
+            detail_header: "Author",
+            extra_headers: &["Labels", "Updated", "Planned"],
         },
     )
 }
@@ -191,7 +197,8 @@ fn pick_pr_id() -> Result<Option<String>> {
             prompt: "git ws pr>",
             marker_header: "PR",
             name_header: "Title",
-            detail_header: "Head",
+            detail_header: "Author",
+            extra_headers: &["Head", "Base", "State", "Updated"],
         },
     )
 }
@@ -273,16 +280,96 @@ fn cmd_doctor() -> Result<()> {
 
 fn print_candidate_table(candidates: &[Candidate]) {
     println!("git-ws worktrees");
-    println!("{:<12} {:<40} Detail", "Status", "Name");
-    println!("{:-<12} {:-<40} {:-<1}", "", "", "");
+    println!(
+        "{:<12} {:<34} {:<28} {:<16} {:<10} {:<28} Action",
+        "Status", "Name", "Upstream", "Track", "Head", "Path"
+    );
+    println!(
+        "{:-<12} {:-<34} {:-<28} {:-<16} {:-<10} {:-<28} {:-<1}",
+        "", "", "", "", "", "", ""
+    );
     for candidate in candidates {
         println!(
-            "{:<12} {:<40} {}",
-            candidate.availability_label(),
+            "{} {:<34} {} {} {:<10} {} {}",
+            color_candidate_status(candidate, 12),
             candidate.name,
-            candidate.detail()
+            color_remote(&candidate.upstream_label(), 28),
+            color_tracking(candidate, 16),
+            candidate.head_label(),
+            color_path(candidate, 28),
+            color_info(&candidate.action_label())
         );
     }
+}
+
+#[derive(Serialize)]
+struct CandidateRecord<'a> {
+    #[serde(flatten)]
+    candidate: &'a Candidate,
+    action: String,
+}
+
+fn print_candidates_json(candidates: &[Candidate]) -> Result<()> {
+    let records: Vec<_> = candidates
+        .iter()
+        .map(|candidate| CandidateRecord {
+            candidate,
+            action: candidate.action_label(),
+        })
+        .collect();
+    println!("{}", serde_json::to_string_pretty(&records)?);
+    Ok(())
+}
+
+fn color_candidate_status(candidate: &Candidate, width: usize) -> String {
+    let code = if candidate.worktree_path.is_some() {
+        32
+    } else if candidate.local_ref.is_some() {
+        33
+    } else if candidate.remote_ref.is_some() {
+        36
+    } else {
+        2
+    };
+    color_padded(&candidate.availability_label(), code, width)
+}
+
+fn color_tracking(candidate: &Candidate, width: usize) -> String {
+    let code = match candidate.tracking.state {
+        TrackingState::InSync | TrackingState::NoUpstream => 2,
+        TrackingState::Ahead => 34,
+        TrackingState::Behind | TrackingState::Diverged => 35,
+        TrackingState::Gone => 31,
+    };
+    color_padded(&candidate.tracking.summary, code, width)
+}
+
+fn color_remote(value: &str, width: usize) -> String {
+    if value == "-" {
+        color_padded(value, 2, width)
+    } else {
+        color_padded(value, 36, width)
+    }
+}
+
+fn color_path(candidate: &Candidate, width: usize) -> String {
+    if candidate.worktree_path.is_some() {
+        color_padded(&candidate.path_label(), 32, width)
+    } else {
+        color_padded("-", 2, width)
+    }
+}
+
+fn color_info(value: &str) -> String {
+    color(value, 36)
+}
+
+fn color(value: &str, code: u8) -> String {
+    format!("\x1b[{code}m{value}\x1b[0m")
+}
+
+fn color_padded(value: &str, code: u8, width: usize) -> String {
+    color(&format!("{value:<width$}"), code)
 }
 
 fn run_candidate(candidate: Candidate) -> Result<()> {
@@ -501,7 +588,9 @@ Usage:
   git ws doctor
 
 Run open, issue, or pr without a target to use the interactive fuzzy picker.
+TTY views show colored status columns; non-TTY and JSON output stay plain.
+list --json adds tracking/action fields; cleanup --json adds eligibility/action fields.
 Use `git ws open --type remote` to pick from remote branches only.
-"#
+ "#
     );
 }

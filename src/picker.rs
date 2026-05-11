@@ -8,10 +8,10 @@ use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{Cell, Paragraph, Row, Table, TableState, Wrap};
 
-use crate::candidates::Candidate;
+use crate::candidates::{Candidate, TrackingState};
 use crate::tui::{
-    self, HIGHLIGHT_SYMBOL, NavCommand, Outcome, TuiTerminal, header_style, label_line, panel,
-    row_highlight_style,
+    self, HIGHLIGHT_SYMBOL, NavCommand, Outcome, Tone, TuiTerminal, header_style, label_line,
+    panel, row_highlight_style, tone_style,
 };
 
 const VISIBLE_ROWS: usize = 15;
@@ -22,8 +22,24 @@ pub struct PickerEntry<T> {
     pub marker: String,
     pub name: String,
     pub detail: String,
+    pub extra_columns: Vec<String>,
+    pub tones: Vec<CellTone>,
     pub action: String,
     pub search_text: String,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CellTone {
+    Default,
+    Dim,
+    Worktree,
+    Local,
+    Remote,
+    Good,
+    Warning,
+    Bad,
+    Info,
+    Behind,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -32,6 +48,7 @@ pub struct PickerView<'a> {
     pub marker_header: &'a str,
     pub name_header: &'a str,
     pub detail_header: &'a str,
+    pub extra_headers: &'a [&'a str],
 }
 
 pub fn pick_candidate(
@@ -50,7 +67,8 @@ pub fn pick_candidate(
             prompt: "git ws>",
             marker_header: "Avail",
             name_header: "Name",
-            detail_header: "Detail",
+            detail_header: "Upstream",
+            extra_headers: &["Track", "Head", "Path", "Action"],
         },
     )
 }
@@ -306,31 +324,26 @@ fn render_picker<T>(
             chunks[1],
         );
     } else {
-        let header = Row::new([
-            Cell::from(view.marker_header),
-            Cell::from(view.name_header),
-            Cell::from(view.detail_header),
-        ])
-        .style(header_style());
+        let headers = view.headers();
+        let header =
+            Row::new(headers.iter().map(|header| Cell::from(*header))).style(header_style());
         let rows = ranked.iter().map(|entry| {
-            Row::new([
-                Cell::from(entry.marker.as_str()),
-                Cell::from(entry.name.as_str()),
-                Cell::from(entry.detail.as_str()),
-            ])
+            Row::new(
+                entry
+                    .display_columns()
+                    .into_iter()
+                    .enumerate()
+                    .map(|(index, value)| {
+                        let tone = entry.tones.get(index).copied().unwrap_or(CellTone::Default);
+                        Cell::from(value).style(tone_style(tui_tone(tone)))
+                    }),
+            )
         });
-        let table = Table::new(
-            rows,
-            [
-                Constraint::Length(12),
-                Constraint::Percentage(44),
-                Constraint::Min(20),
-            ],
-        )
-        .header(header)
-        .block(panel(" candidates "))
-        .row_highlight_style(row_highlight_style())
-        .highlight_symbol(HIGHLIGHT_SYMBOL);
+        let table = Table::new(rows, view.widths())
+            .header(header)
+            .block(panel(" candidates "))
+            .row_highlight_style(row_highlight_style())
+            .highlight_symbol(HIGHLIGHT_SYMBOL);
         let scroll_offset = state
             .selected
             .saturating_sub(VISIBLE_ROWS.saturating_sub(1));
@@ -342,14 +355,21 @@ fn render_picker<T>(
     let detail = ranked
         .get(state.selected)
         .map(|entry| {
-            vec![
+            let mut lines = vec![
                 Line::from(vec![
                     Span::styled("Selected ", Style::default().fg(Color::DarkGray)),
                     Span::styled(&entry.name, Style::default().fg(Color::White)),
                 ]),
                 label_line("Detail   ", &entry.detail),
                 label_line("Action   ", &entry.action),
-            ]
+            ];
+            for (header, value) in view.extra_headers.iter().zip(entry.extra_columns.iter()) {
+                lines.push(Line::from(vec![
+                    Span::styled(format!("{header:<9}"), Style::default().fg(Color::DarkGray)),
+                    Span::raw(value.clone()),
+                ]));
+            }
+            lines
         })
         .unwrap_or_else(|| vec![Line::from("No selectable candidate")]);
     frame.render_widget(
@@ -368,26 +388,122 @@ fn render_picker<T>(
 
 fn candidate_entry(candidate: Candidate) -> PickerEntry<Candidate> {
     let name = candidate.name.clone();
-    let detail = candidate.detail();
+    let upstream = candidate.upstream_label();
+    let track = candidate.tracking.summary.clone();
+    let head = candidate.head_label();
+    let path = candidate.path_label();
+    let action = candidate.action_label();
     PickerEntry {
         marker: candidate.availability_label(),
-        detail: detail.clone(),
-        action: action_label(&candidate),
-        search_text: format!("{name} {detail}"),
+        detail: upstream.clone(),
+        extra_columns: vec![track.clone(), head.clone(), path.clone(), action.clone()],
+        tones: vec![
+            availability_tone(&candidate),
+            CellTone::Default,
+            upstream_tone(&candidate),
+            tracking_tone(&candidate.tracking.state),
+            CellTone::Dim,
+            if candidate.worktree_path.is_some() {
+                CellTone::Worktree
+            } else {
+                CellTone::Dim
+            },
+            CellTone::Info,
+        ],
+        action,
+        search_text: format!("{name} {upstream} {track} {head} {path}"),
         name,
         value: candidate,
     }
 }
 
-fn action_label(candidate: &Candidate) -> String {
-    if let Some(path) = &candidate.worktree_path {
-        format!("cd {}", path.display())
-    } else if let Some(local) = &candidate.local_ref {
-        format!("git switch {local}")
-    } else if let Some(remote) = &candidate.remote_ref {
-        format!("git switch -c {} --track {remote}", candidate.name)
+impl<'a> PickerView<'a> {
+    fn headers(&self) -> Vec<&'a str> {
+        let mut headers = vec![self.marker_header, self.name_header, self.detail_header];
+        headers.extend_from_slice(self.extra_headers);
+        headers
+    }
+
+    fn widths(&self) -> Vec<Constraint> {
+        let headers = self.headers();
+        if headers.len() == 3 {
+            return vec![
+                Constraint::Length(12),
+                Constraint::Percentage(44),
+                Constraint::Min(20),
+            ];
+        }
+        headers
+            .iter()
+            .enumerate()
+            .map(|(index, header)| match (index, *header) {
+                (0, _) => Constraint::Length(12),
+                (1, _) => Constraint::Percentage(28),
+                (_, "Track" | "State") => Constraint::Length(16),
+                (_, "Head" | "Updated") => Constraint::Length(11),
+                (_, "Base") => Constraint::Length(14),
+                (_, "Labels") => Constraint::Length(18),
+                (_, "Path" | "Action" | "Planned") => Constraint::Min(18),
+                _ => Constraint::Percentage(16),
+            })
+            .collect()
+    }
+}
+
+impl<T> PickerEntry<T> {
+    fn display_columns(&self) -> Vec<&str> {
+        let mut columns = vec![
+            self.marker.as_str(),
+            self.name.as_str(),
+            self.detail.as_str(),
+        ];
+        columns.extend(self.extra_columns.iter().map(String::as_str));
+        columns
+    }
+}
+
+fn availability_tone(candidate: &Candidate) -> CellTone {
+    if candidate.worktree_path.is_some() {
+        CellTone::Worktree
+    } else if candidate.local_ref.is_some() {
+        CellTone::Local
+    } else if candidate.remote_ref.is_some() {
+        CellTone::Remote
     } else {
-        "unavailable".to_string()
+        CellTone::Dim
+    }
+}
+
+fn upstream_tone(candidate: &Candidate) -> CellTone {
+    if candidate.upstream.is_some() || candidate.remote_ref.is_some() {
+        CellTone::Remote
+    } else {
+        CellTone::Dim
+    }
+}
+
+fn tracking_tone(state: &TrackingState) -> CellTone {
+    match state {
+        TrackingState::InSync => CellTone::Dim,
+        TrackingState::Ahead => CellTone::Info,
+        TrackingState::Behind | TrackingState::Diverged => CellTone::Behind,
+        TrackingState::Gone => CellTone::Bad,
+        TrackingState::NoUpstream => CellTone::Dim,
+    }
+}
+
+fn tui_tone(tone: CellTone) -> Tone {
+    match tone {
+        CellTone::Default => Tone::Default,
+        CellTone::Dim => Tone::Dim,
+        CellTone::Worktree => Tone::Worktree,
+        CellTone::Local => Tone::Local,
+        CellTone::Remote => Tone::Remote,
+        CellTone::Good => Tone::Good,
+        CellTone::Warning => Tone::Warning,
+        CellTone::Bad => Tone::Bad,
+        CellTone::Info => Tone::Info,
+        CellTone::Behind => Tone::Behind,
     }
 }
 
@@ -460,6 +576,8 @@ mod tests {
                 marker: "#1".to_string(),
                 name: "feat: add git-ws CLI".to_string(),
                 detail: "feat/implement-git-ws-cli".to_string(),
+                extra_columns: vec![],
+                tones: vec![],
                 action: "create worktree for PR #1".to_string(),
                 search_text: "#1 feat: add git-ws CLI feat/implement-git-ws-cli".to_string(),
             },
@@ -468,6 +586,8 @@ mod tests {
                 marker: "#2".to_string(),
                 name: "fix: cleanup default branch".to_string(),
                 detail: "fix/cleanup-default".to_string(),
+                extra_columns: vec![],
+                tones: vec![],
                 action: "create worktree for PR #2".to_string(),
                 search_text: "#2 fix cleanup default branch fix/cleanup-default".to_string(),
             },
@@ -477,7 +597,7 @@ mod tests {
             query: "git".to_string(),
             selected: 0,
         };
-        let mut terminal = Terminal::new(TestBackend::new(88, 18)).expect("terminal");
+        let mut terminal = Terminal::new(TestBackend::new(140, 18)).expect("terminal");
 
         terminal
             .draw(|frame| {
@@ -490,6 +610,7 @@ mod tests {
                         marker_header: "PR",
                         name_header: "Title",
                         detail_header: "Head",
+                        extra_headers: &[],
                     },
                 );
             })
@@ -506,6 +627,8 @@ mod tests {
                 marker: format!("#{number}"),
                 name: format!("candidate-{number:02}"),
                 detail: format!("branch-{number:02}"),
+                extra_columns: vec![],
+                tones: vec![],
                 action: format!("create worktree {number:02}"),
                 search_text: format!("candidate-{number:02} branch-{number:02}"),
             })
@@ -528,6 +651,7 @@ mod tests {
                         marker_header: "PR",
                         name_header: "Title",
                         detail_header: "Head",
+                        extra_headers: &[],
                     },
                 );
             })

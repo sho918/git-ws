@@ -4,7 +4,9 @@ use std::path::PathBuf;
 use anyhow::Result;
 use serde::Serialize;
 
-use crate::git::{Worktree, list_local_branches, list_remote_branches, list_worktrees};
+use crate::git::{
+    LocalBranch, Worktree, list_local_branches, list_remote_branches, list_worktrees,
+};
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct Candidate {
@@ -16,6 +18,26 @@ pub struct Candidate {
     pub worktree_head: Option<String>,
     pub local_head: Option<String>,
     pub remote_head: Option<String>,
+    pub tracking: TrackingInfo,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum TrackingState {
+    InSync,
+    Ahead,
+    Behind,
+    Diverged,
+    Gone,
+    NoUpstream,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct TrackingInfo {
+    pub state: TrackingState,
+    pub ahead: u32,
+    pub behind: u32,
+    pub summary: String,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -58,6 +80,7 @@ impl Candidate {
             worktree_head: None,
             local_head: None,
             remote_head: None,
+            tracking: TrackingInfo::no_upstream(),
         }
     }
 
@@ -82,6 +105,111 @@ impl Candidate {
             flag(self.remote_ref.is_some(), 'R'),
         )
     }
+
+    pub fn head_label(&self) -> String {
+        self.worktree_head
+            .as_ref()
+            .or(self.local_head.as_ref())
+            .or(self.remote_head.as_ref())
+            .map(|head| short_head(head))
+            .unwrap_or_else(|| "-".to_string())
+    }
+
+    pub fn path_label(&self) -> String {
+        self.worktree_path
+            .as_ref()
+            .map(|path| path.display().to_string())
+            .unwrap_or_else(|| "-".to_string())
+    }
+
+    pub fn upstream_label(&self) -> String {
+        self.upstream
+            .as_ref()
+            .or(self.remote_ref.as_ref())
+            .cloned()
+            .unwrap_or_else(|| "-".to_string())
+    }
+
+    pub fn action_label(&self) -> String {
+        if let Some(path) = &self.worktree_path {
+            format!("cd {}", path.display())
+        } else if let Some(local) = &self.local_ref {
+            format!("git switch {local}")
+        } else if let Some(remote) = &self.remote_ref {
+            format!("git switch -c {} --track {remote}", self.name)
+        } else {
+            "unavailable".to_string()
+        }
+    }
+}
+
+fn short_head(head: &str) -> String {
+    head.get(..7).unwrap_or(head).to_string()
+}
+
+impl TrackingInfo {
+    pub fn no_upstream() -> Self {
+        Self {
+            state: TrackingState::NoUpstream,
+            ahead: 0,
+            behind: 0,
+            summary: "no_upstream".to_string(),
+        }
+    }
+
+    pub fn from_git_track(track: Option<&str>, has_upstream: bool) -> Self {
+        if !has_upstream {
+            return Self::no_upstream();
+        }
+        let Some(track) = track.filter(|value| !value.is_empty()) else {
+            return Self {
+                state: TrackingState::InSync,
+                ahead: 0,
+                behind: 0,
+                summary: "in_sync".to_string(),
+            };
+        };
+        if track == "[gone]" {
+            return Self {
+                state: TrackingState::Gone,
+                ahead: 0,
+                behind: 0,
+                summary: "gone".to_string(),
+            };
+        }
+
+        let mut ahead = 0;
+        let mut behind = 0;
+        for part in track.trim_matches(['[', ']']).split(',') {
+            let mut values = part.split_whitespace();
+            match (values.next(), values.next()) {
+                (Some("ahead"), Some(value)) => ahead = value.parse().unwrap_or(0),
+                (Some("behind"), Some(value)) => behind = value.parse().unwrap_or(0),
+                _ => {}
+            }
+        }
+
+        let state = match (ahead > 0, behind > 0) {
+            (true, true) => TrackingState::Diverged,
+            (true, false) => TrackingState::Ahead,
+            (false, true) => TrackingState::Behind,
+            (false, false) => TrackingState::InSync,
+        };
+        let summary = match state {
+            TrackingState::Ahead => format!("ahead {ahead}"),
+            TrackingState::Behind => format!("behind {behind}"),
+            TrackingState::Diverged => format!("ahead {ahead}, behind {behind}"),
+            TrackingState::InSync => "in_sync".to_string(),
+            TrackingState::Gone => "gone".to_string(),
+            TrackingState::NoUpstream => "no_upstream".to_string(),
+        };
+        Self {
+            state,
+            ahead,
+            behind,
+            summary,
+        }
+    }
 }
 
 pub fn load_candidates(filter: CandidateFilter) -> Result<Vec<Candidate>> {
@@ -103,7 +231,7 @@ pub fn load_candidates(filter: CandidateFilter) -> Result<Vec<Candidate>> {
 
 pub fn merge_candidates(
     worktrees: Vec<Worktree>,
-    local_branches: Vec<(String, Option<String>, String)>,
+    local_branches: Vec<LocalBranch>,
     remote_branches: Vec<(String, String, String)>,
 ) -> Vec<Candidate> {
     let mut candidates = BTreeMap::<String, Candidate>::new();
@@ -123,13 +251,15 @@ pub fn merge_candidates(
         candidate.worktree_head = worktree.head;
     }
 
-    for (branch, upstream, head) in local_branches {
+    for (branch, upstream, track, head) in local_branches {
         let candidate = candidates
             .entry(local_candidate_key(&branch))
             .or_insert_with(|| Candidate::new(branch.clone()));
+        let has_upstream = upstream.is_some();
         candidate.local_ref = Some(branch);
         candidate.upstream = upstream;
         candidate.local_head = Some(head);
+        candidate.tracking = TrackingInfo::from_git_track(track.as_deref(), has_upstream);
     }
 
     for (name, remote_ref, head) in remote_branches {

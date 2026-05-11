@@ -6,7 +6,7 @@ use serde::Deserialize;
 use crate::git::{
     emit_cd_path, git_output, git_status, list_worktrees_after_prune_if_stale, remote_names,
 };
-use crate::picker::PickerEntry;
+use crate::picker::{CellTone, PickerEntry};
 use crate::worktree::{
     CreateWorktreeOptions, create_worktree, create_worktree_unchecked,
     ensure_worktree_init_trusted, worktree_path_for_existing_branch,
@@ -16,6 +16,12 @@ use crate::worktree::{
 pub struct IssueListItem {
     pub number: u64,
     pub title: String,
+    #[serde(default)]
+    pub author: Option<GitHubUser>,
+    #[serde(default)]
+    pub labels: Vec<GitHubLabel>,
+    #[serde(default, rename = "updatedAt")]
+    pub updated_at: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
@@ -25,6 +31,28 @@ pub struct PullRequestListItem {
     pub title: String,
     pub head_ref_name: String,
     pub is_cross_repository: bool,
+    #[serde(default)]
+    pub author: Option<GitHubUser>,
+    #[serde(default, rename = "baseRefName")]
+    pub base_ref_name: Option<String>,
+    #[serde(default, rename = "isDraft")]
+    pub is_draft: bool,
+    #[serde(default, rename = "reviewDecision")]
+    pub review_decision: Option<String>,
+    #[serde(default)]
+    pub labels: Vec<GitHubLabel>,
+    #[serde(default, rename = "updatedAt")]
+    pub updated_at: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+pub struct GitHubUser {
+    pub login: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+pub struct GitHubLabel {
+    pub name: String,
 }
 
 #[derive(Debug, Deserialize)]
@@ -114,7 +142,7 @@ pub fn list_open_issues() -> Result<Vec<IssueListItem>> {
         "--limit",
         "100",
         "--json",
-        "number,title",
+        "number,title,author,labels,updatedAt",
     ])
 }
 
@@ -127,7 +155,7 @@ pub fn list_open_prs() -> Result<Vec<PullRequestListItem>> {
         "--limit",
         "100",
         "--json",
-        "number,title,headRefName,isCrossRepository",
+        "number,title,headRefName,isCrossRepository,author,baseRefName,isDraft,reviewDecision,labels,updatedAt",
     ])
 }
 
@@ -136,12 +164,28 @@ pub fn issue_picker_entries(issues: &[IssueListItem]) -> Vec<PickerEntry<String>
         .iter()
         .map(|issue| {
             let number = issue.number.to_string();
+            let author = author_label(issue.author.as_ref());
+            let labels = labels_label(&issue.labels);
+            let updated = date_label(issue.updated_at.as_deref());
+            let branch = format!("issue/{}-{}", issue.number, slugify_title(&issue.title));
             PickerEntry {
                 marker: format!("#{number}"),
                 name: issue.title.clone(),
-                detail: "open issue".to_string(),
+                detail: author.clone(),
+                extra_columns: vec![labels.clone(), updated.clone(), branch.clone()],
+                tones: vec![
+                    CellTone::Info,
+                    CellTone::Default,
+                    CellTone::Local,
+                    CellTone::Warning,
+                    CellTone::Dim,
+                    CellTone::Info,
+                ],
                 action: format!("create worktree for issue #{number}"),
-                search_text: format!("#{number} {}", issue.title),
+                search_text: format!(
+                    "#{number} {} {author} {labels} {updated} {branch}",
+                    issue.title
+                ),
                 value: number,
             }
         })
@@ -152,21 +196,88 @@ pub fn pr_picker_entries(prs: &[PullRequestListItem]) -> Vec<PickerEntry<String>
     prs.iter()
         .map(|pr| {
             let number = pr.number.to_string();
-            let detail = if pr.is_cross_repository {
+            let head = if pr.is_cross_repository {
                 format!("fork:{}", pr.head_ref_name)
             } else {
                 pr.head_ref_name.clone()
             };
+            let author = author_label(pr.author.as_ref());
+            let base = pr.base_ref_name.clone().unwrap_or_else(|| "-".to_string());
+            let state = pr_state_label(pr);
+            let updated = date_label(pr.updated_at.as_deref());
             PickerEntry {
                 marker: format!("#{number}"),
                 name: pr.title.clone(),
-                detail,
+                detail: author.clone(),
+                extra_columns: vec![head.clone(), base.clone(), state.clone(), updated.clone()],
+                tones: vec![
+                    CellTone::Info,
+                    CellTone::Default,
+                    CellTone::Local,
+                    CellTone::Remote,
+                    CellTone::Dim,
+                    pr_state_tone(pr),
+                    CellTone::Dim,
+                ],
                 action: format!("create worktree for PR #{number}"),
-                search_text: format!("#{number} {} {}", pr.title, pr.head_ref_name),
+                search_text: format!(
+                    "#{number} {} {author} {head} {base} {state} {updated}",
+                    pr.title
+                ),
                 value: number,
             }
         })
         .collect()
+}
+
+fn author_label(author: Option<&GitHubUser>) -> String {
+    author
+        .map(|user| user.login.clone())
+        .unwrap_or_else(|| "-".to_string())
+}
+
+fn labels_label(labels: &[GitHubLabel]) -> String {
+    if labels.is_empty() {
+        "-".to_string()
+    } else {
+        labels
+            .iter()
+            .map(|label| label.name.as_str())
+            .collect::<Vec<_>>()
+            .join(",")
+    }
+}
+
+fn date_label(value: Option<&str>) -> String {
+    value
+        .and_then(|value| value.get(..10))
+        .unwrap_or("-")
+        .to_string()
+}
+
+fn pr_state_label(pr: &PullRequestListItem) -> String {
+    if pr.is_draft {
+        return "draft".to_string();
+    }
+    match pr.review_decision.as_deref() {
+        Some("APPROVED") => "approved",
+        Some("CHANGES_REQUESTED") => "changes_requested",
+        Some("REVIEW_REQUIRED") => "review_required",
+        _ => "open",
+    }
+    .to_string()
+}
+
+fn pr_state_tone(pr: &PullRequestListItem) -> CellTone {
+    if pr.is_draft {
+        return CellTone::Warning;
+    }
+    match pr.review_decision.as_deref() {
+        Some("APPROVED") => CellTone::Good,
+        Some("CHANGES_REQUESTED") => CellTone::Bad,
+        Some("REVIEW_REQUIRED") => CellTone::Behind,
+        _ => CellTone::Dim,
+    }
 }
 
 pub fn slugify_title(title: &str) -> String {
