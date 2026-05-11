@@ -343,6 +343,7 @@ fn picker_query_without_match_returns_error() {
             name_header: "Name",
             detail_header: "Detail",
             extra_headers: &[],
+            widths: git_ws::picker::DEFAULT_PICKER_WIDTHS,
         },
     )
     .unwrap_err();

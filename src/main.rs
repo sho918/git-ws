@@ -18,7 +18,27 @@ use git_ws::picker::{PickerView, pick_candidate, pick_entry};
 use git_ws::shell::init_script;
 use git_ws::worktree::{CreateWorktreeOptions, create_worktree, find_worktree_for_branch};
 use lexopt::prelude::*;
+use ratatui::layout::Constraint;
 use serde::Serialize;
+
+const ISSUE_PICKER_WIDTHS: &[Constraint] = &[
+    Constraint::Length(12),
+    Constraint::Percentage(28),
+    Constraint::Percentage(16),
+    Constraint::Length(18),
+    Constraint::Length(11),
+    Constraint::Min(18),
+];
+
+const PR_PICKER_WIDTHS: &[Constraint] = &[
+    Constraint::Length(12),
+    Constraint::Percentage(28),
+    Constraint::Percentage(16),
+    Constraint::Length(11),
+    Constraint::Length(14),
+    Constraint::Length(16),
+    Constraint::Length(11),
+];
 
 fn main() {
     if let Err(error) = run() {
@@ -183,6 +203,7 @@ fn pick_issue_id() -> Result<Option<String>> {
             name_header: "Title",
             detail_header: "Author",
             extra_headers: &["Labels", "Updated", "Planned"],
+            widths: ISSUE_PICKER_WIDTHS,
         },
     )
 }
@@ -199,6 +220,7 @@ fn pick_pr_id() -> Result<Option<String>> {
             name_header: "Title",
             detail_header: "Author",
             extra_headers: &["Head", "Base", "State", "Updated"],
+            widths: PR_PICKER_WIDTHS,
         },
     )
 }
@@ -293,7 +315,7 @@ fn print_candidate_table(candidates: &[Candidate]) {
             "{} {:<34} {} {} {:<10} {} {}",
             color_candidate_status(candidate, 12),
             candidate.name,
-            color_remote(&candidate.upstream_label(), 28),
+            color_remote(candidate.upstream_label(), 28),
             color_tracking(candidate, 16),
             candidate.head_label(),
             color_path(candidate, 28),
@@ -369,7 +391,7 @@ fn color(value: &str, code: u8) -> String {
 }
 
 fn color_padded(value: &str, code: u8, width: usize) -> String {
-    color(&format!("{value:<width$}"), code)
+    format!("\x1b[{code}m{value:<width$}\x1b[0m")
 }
 
 fn run_candidate(candidate: Candidate) -> Result<()> {

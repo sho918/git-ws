@@ -6,7 +6,8 @@ use serde::Deserialize;
 use crate::git::{
     emit_cd_path, git_output, git_status, list_worktrees_after_prune_if_stale, remote_names,
 };
-use crate::picker::{CellTone, PickerEntry};
+use crate::picker::PickerEntry;
+use crate::tui::Tone;
 use crate::worktree::{
     CreateWorktreeOptions, create_worktree, create_worktree_unchecked,
     ensure_worktree_init_trusted, worktree_path_for_existing_branch,
@@ -172,12 +173,12 @@ pub fn issue_picker_entries(issues: &[IssueListItem]) -> Vec<PickerEntry<String>
                 detail: author.clone(),
                 extra_columns: vec![labels.clone(), updated.clone(), branch.clone()],
                 tones: vec![
-                    CellTone::Info,
-                    CellTone::Default,
-                    CellTone::Local,
-                    CellTone::Warning,
-                    CellTone::Dim,
-                    CellTone::Info,
+                    Tone::Info,
+                    Tone::Default,
+                    Tone::Local,
+                    Tone::Warning,
+                    Tone::Dim,
+                    Tone::Info,
                 ],
                 action: format!("create worktree for issue #{number}"),
                 search_text: format!(
@@ -209,13 +210,13 @@ pub fn pr_picker_entries(prs: &[PullRequestListItem]) -> Vec<PickerEntry<String>
                 detail: author.clone(),
                 extra_columns: vec![head.clone(), base.clone(), state.clone(), updated.clone()],
                 tones: vec![
-                    CellTone::Info,
-                    CellTone::Default,
-                    CellTone::Local,
-                    CellTone::Remote,
-                    CellTone::Dim,
+                    Tone::Info,
+                    Tone::Default,
+                    Tone::Local,
+                    Tone::Remote,
+                    Tone::Dim,
                     pr_state_tone(pr),
-                    CellTone::Dim,
+                    Tone::Dim,
                 ],
                 action: format!("create worktree for PR #{number}"),
                 search_text: format!(
@@ -266,15 +267,15 @@ fn pr_state_label(pr: &PullRequestListItem) -> String {
     .to_string()
 }
 
-fn pr_state_tone(pr: &PullRequestListItem) -> CellTone {
+fn pr_state_tone(pr: &PullRequestListItem) -> Tone {
     if pr.is_draft {
-        return CellTone::Warning;
+        return Tone::Warning;
     }
     match pr.review_decision.as_deref() {
-        Some("APPROVED") => CellTone::Good,
-        Some("CHANGES_REQUESTED") => CellTone::Bad,
-        Some("REVIEW_REQUIRED") => CellTone::Behind,
-        _ => CellTone::Dim,
+        Some("APPROVED") => Tone::Good,
+        Some("CHANGES_REQUESTED") => Tone::Bad,
+        Some("REVIEW_REQUIRED") => Tone::Behind,
+        _ => Tone::Dim,
     }
 }
 

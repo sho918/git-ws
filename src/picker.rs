@@ -15,6 +15,7 @@ use crate::tui::{
 };
 
 const VISIBLE_ROWS: usize = 15;
+const BASE_DETAIL_HEIGHT: u16 = 5;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct PickerEntry<T> {
@@ -23,23 +24,9 @@ pub struct PickerEntry<T> {
     pub name: String,
     pub detail: String,
     pub extra_columns: Vec<String>,
-    pub tones: Vec<CellTone>,
+    pub tones: Vec<Tone>,
     pub action: String,
     pub search_text: String,
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum CellTone {
-    Default,
-    Dim,
-    Worktree,
-    Local,
-    Remote,
-    Good,
-    Warning,
-    Bad,
-    Info,
-    Behind,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -49,7 +36,24 @@ pub struct PickerView<'a> {
     pub name_header: &'a str,
     pub detail_header: &'a str,
     pub extra_headers: &'a [&'a str],
+    pub widths: &'a [Constraint],
 }
+
+pub const DEFAULT_PICKER_WIDTHS: &[Constraint] = &[
+    Constraint::Length(12),
+    Constraint::Percentage(44),
+    Constraint::Min(20),
+];
+
+const CANDIDATE_PICKER_WIDTHS: &[Constraint] = &[
+    Constraint::Length(12),
+    Constraint::Percentage(28),
+    Constraint::Percentage(16),
+    Constraint::Length(16),
+    Constraint::Length(11),
+    Constraint::Min(18),
+    Constraint::Min(18),
+];
 
 pub fn pick_candidate(
     candidates: &[Candidate],
@@ -69,6 +73,7 @@ pub fn pick_candidate(
             name_header: "Name",
             detail_header: "Upstream",
             extra_headers: &["Track", "Head", "Path", "Action"],
+            widths: CANDIDATE_PICKER_WIDTHS,
         },
     )
 }
@@ -298,12 +303,14 @@ fn render_picker<T>(
     view: PickerView<'_>,
 ) {
     let area = frame.area();
+    let detail_height = BASE_DETAIL_HEIGHT
+        .saturating_add(u16::try_from(view.extra_headers.len()).unwrap_or(u16::MAX));
     let chunks = Layout::default()
         .direction(Direction::Vertical)
         .constraints([
             Constraint::Length(3),
             Constraint::Min(6),
-            Constraint::Length(5),
+            Constraint::Length(detail_height),
             Constraint::Length(1),
         ])
         .split(area);
@@ -324,22 +331,20 @@ fn render_picker<T>(
             chunks[1],
         );
     } else {
-        let headers = view.headers();
-        let header =
-            Row::new(headers.iter().map(|header| Cell::from(*header))).style(header_style());
+        let header = Row::new(
+            [view.marker_header, view.name_header, view.detail_header]
+                .into_iter()
+                .chain(view.extra_headers.iter().copied())
+                .map(Cell::from),
+        )
+        .style(header_style());
         let rows = ranked.iter().map(|entry| {
-            Row::new(
-                entry
-                    .display_columns()
-                    .into_iter()
-                    .enumerate()
-                    .map(|(index, value)| {
-                        let tone = entry.tones.get(index).copied().unwrap_or(CellTone::Default);
-                        Cell::from(value).style(tone_style(tui_tone(tone)))
-                    }),
-            )
+            Row::new(entry.display_columns().enumerate().map(|(index, value)| {
+                let tone = entry.tones.get(index).copied().unwrap_or(Tone::Default);
+                Cell::from(value).style(tone_style(tone))
+            }))
         });
-        let table = Table::new(rows, view.widths())
+        let table = Table::new(rows, view.widths.iter().copied())
             .header(header)
             .block(panel(" candidates "))
             .row_highlight_style(row_highlight_style())
@@ -388,122 +393,80 @@ fn render_picker<T>(
 
 fn candidate_entry(candidate: Candidate) -> PickerEntry<Candidate> {
     let name = candidate.name.clone();
-    let upstream = candidate.upstream_label();
+    let marker = candidate.availability_label();
+    let upstream = candidate.upstream_label().to_string();
     let track = candidate.tracking.summary.clone();
-    let head = candidate.head_label();
+    let head = candidate.head_label().to_string();
     let path = candidate.path_label();
     let action = candidate.action_label();
+    let availability = availability_tone(&candidate);
+    let up_tone = upstream_tone(&candidate);
+    let track_tone = tracking_tone(&candidate.tracking.state);
+    let path_tone = if candidate.worktree_path.is_some() {
+        Tone::Worktree
+    } else {
+        Tone::Dim
+    };
+    let search_text = format!("{name} {upstream} {track} {head} {path}");
     PickerEntry {
-        marker: candidate.availability_label(),
-        detail: upstream.clone(),
-        extra_columns: vec![track.clone(), head.clone(), path.clone(), action.clone()],
+        marker,
+        detail: upstream,
+        extra_columns: vec![track, head, path, action.clone()],
         tones: vec![
-            availability_tone(&candidate),
-            CellTone::Default,
-            upstream_tone(&candidate),
-            tracking_tone(&candidate.tracking.state),
-            CellTone::Dim,
-            if candidate.worktree_path.is_some() {
-                CellTone::Worktree
-            } else {
-                CellTone::Dim
-            },
-            CellTone::Info,
+            availability,
+            Tone::Default,
+            up_tone,
+            track_tone,
+            Tone::Dim,
+            path_tone,
+            Tone::Info,
         ],
         action,
-        search_text: format!("{name} {upstream} {track} {head} {path}"),
+        search_text,
         name,
         value: candidate,
     }
 }
 
-impl<'a> PickerView<'a> {
-    fn headers(&self) -> Vec<&'a str> {
-        let mut headers = vec![self.marker_header, self.name_header, self.detail_header];
-        headers.extend_from_slice(self.extra_headers);
-        headers
-    }
-
-    fn widths(&self) -> Vec<Constraint> {
-        let headers = self.headers();
-        if headers.len() == 3 {
-            return vec![
-                Constraint::Length(12),
-                Constraint::Percentage(44),
-                Constraint::Min(20),
-            ];
-        }
-        headers
-            .iter()
-            .enumerate()
-            .map(|(index, header)| match (index, *header) {
-                (0, _) => Constraint::Length(12),
-                (1, _) => Constraint::Percentage(28),
-                (_, "Track" | "State") => Constraint::Length(16),
-                (_, "Head" | "Updated") => Constraint::Length(11),
-                (_, "Base") => Constraint::Length(14),
-                (_, "Labels") => Constraint::Length(18),
-                (_, "Path" | "Action" | "Planned") => Constraint::Min(18),
-                _ => Constraint::Percentage(16),
-            })
-            .collect()
-    }
-}
-
 impl<T> PickerEntry<T> {
-    fn display_columns(&self) -> Vec<&str> {
-        let mut columns = vec![
+    fn display_columns(&self) -> impl Iterator<Item = &str> {
+        [
             self.marker.as_str(),
             self.name.as_str(),
             self.detail.as_str(),
-        ];
-        columns.extend(self.extra_columns.iter().map(String::as_str));
-        columns
+        ]
+        .into_iter()
+        .chain(self.extra_columns.iter().map(String::as_str))
     }
 }
 
-fn availability_tone(candidate: &Candidate) -> CellTone {
+fn availability_tone(candidate: &Candidate) -> Tone {
     if candidate.worktree_path.is_some() {
-        CellTone::Worktree
+        Tone::Worktree
     } else if candidate.local_ref.is_some() {
-        CellTone::Local
+        Tone::Local
     } else if candidate.remote_ref.is_some() {
-        CellTone::Remote
+        Tone::Remote
     } else {
-        CellTone::Dim
+        Tone::Dim
     }
 }
 
-fn upstream_tone(candidate: &Candidate) -> CellTone {
+fn upstream_tone(candidate: &Candidate) -> Tone {
     if candidate.upstream.is_some() || candidate.remote_ref.is_some() {
-        CellTone::Remote
+        Tone::Remote
     } else {
-        CellTone::Dim
+        Tone::Dim
     }
 }
 
-fn tracking_tone(state: &TrackingState) -> CellTone {
+fn tracking_tone(state: &TrackingState) -> Tone {
     match state {
-        TrackingState::InSync => CellTone::Dim,
-        TrackingState::Ahead => CellTone::Info,
-        TrackingState::Behind | TrackingState::Diverged => CellTone::Behind,
-        TrackingState::Gone => CellTone::Bad,
-        TrackingState::NoUpstream => CellTone::Dim,
-    }
-}
-
-fn tui_tone(tone: CellTone) -> Tone {
-    match tone {
-        CellTone::Default => Tone::Default,
-        CellTone::Dim => Tone::Dim,
-        CellTone::Worktree => Tone::Worktree,
-        CellTone::Local => Tone::Local,
-        CellTone::Remote => Tone::Remote,
-        CellTone::Good => Tone::Good,
-        CellTone::Warning => Tone::Warning,
-        CellTone::Bad => Tone::Bad,
-        CellTone::Info => Tone::Info,
-        CellTone::Behind => Tone::Behind,
+        TrackingState::InSync => Tone::Dim,
+        TrackingState::Ahead => Tone::Info,
+        TrackingState::Behind | TrackingState::Diverged => Tone::Behind,
+        TrackingState::Gone => Tone::Bad,
+        TrackingState::NoUpstream => Tone::Dim,
     }
 }
 
@@ -611,12 +574,67 @@ mod tests {
                         name_header: "Title",
                         detail_header: "Head",
                         extra_headers: &[],
+                        widths: DEFAULT_PICKER_WIDTHS,
                     },
                 );
             })
             .expect("draw");
 
         assert_snapshot!(terminal.backend());
+    }
+
+    #[test]
+    fn render_picker_expands_detail_panel_for_extra_metadata() {
+        let entries = [PickerEntry {
+            value: "1",
+            marker: "#1".to_string(),
+            name: "fix: show metadata".to_string(),
+            detail: "mona".to_string(),
+            extra_columns: vec![
+                "ui, picker".to_string(),
+                "2026-05-12".to_string(),
+                "milestone-1".to_string(),
+            ],
+            tones: vec![],
+            action: "create worktree for issue #1".to_string(),
+            search_text: "#1 fix show metadata mona ui picker 2026-05-12".to_string(),
+        }];
+        let ranked: Vec<_> = entries.iter().collect();
+        let state = PickerState {
+            query: String::new(),
+            selected: 0,
+        };
+        let mut terminal = Terminal::new(TestBackend::new(120, 20)).expect("terminal");
+
+        terminal
+            .draw(|frame| {
+                render_picker(
+                    frame,
+                    &state,
+                    &ranked,
+                    PickerView {
+                        prompt: "git ws issue>",
+                        marker_header: "Issue",
+                        name_header: "Title",
+                        detail_header: "Author",
+                        extra_headers: &["Labels", "Updated", "Planned"],
+                        widths: &[
+                            Constraint::Length(12),
+                            Constraint::Percentage(28),
+                            Constraint::Percentage(16),
+                            Constraint::Length(18),
+                            Constraint::Length(11),
+                            Constraint::Min(18),
+                        ],
+                    },
+                );
+            })
+            .expect("draw");
+
+        let screen = format!("{:?}", terminal.backend());
+        assert!(screen.contains("Labels   ui, picker"), "{screen}");
+        assert!(screen.contains("Updated  2026-05-12"), "{screen}");
+        assert!(screen.contains("Planned  milestone-1"), "{screen}");
     }
 
     #[test]
@@ -652,6 +670,7 @@ mod tests {
                         name_header: "Title",
                         detail_header: "Head",
                         extra_headers: &[],
+                        widths: DEFAULT_PICKER_WIDTHS,
                     },
                 );
             })

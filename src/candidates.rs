@@ -106,13 +106,12 @@ impl Candidate {
         )
     }
 
-    pub fn head_label(&self) -> String {
+    pub fn head_label(&self) -> &str {
         self.worktree_head
-            .as_ref()
-            .or(self.local_head.as_ref())
-            .or(self.remote_head.as_ref())
-            .map(|head| short_head(head))
-            .unwrap_or_else(|| "-".to_string())
+            .as_deref()
+            .or(self.local_head.as_deref())
+            .or(self.remote_head.as_deref())
+            .unwrap_or("-")
     }
 
     pub fn path_label(&self) -> String {
@@ -122,12 +121,11 @@ impl Candidate {
             .unwrap_or_else(|| "-".to_string())
     }
 
-    pub fn upstream_label(&self) -> String {
+    pub fn upstream_label(&self) -> &str {
         self.upstream
-            .as_ref()
-            .or(self.remote_ref.as_ref())
-            .cloned()
-            .unwrap_or_else(|| "-".to_string())
+            .as_deref()
+            .or(self.remote_ref.as_deref())
+            .unwrap_or("-")
     }
 
     pub fn action_label(&self) -> String {
@@ -141,10 +139,6 @@ impl Candidate {
             "unavailable".to_string()
         }
     }
-}
-
-fn short_head(head: &str) -> String {
-    head.get(..7).unwrap_or(head).to_string()
 }
 
 impl TrackingInfo {

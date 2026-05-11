@@ -43,6 +43,18 @@ pub enum CleanupDisposition {
     SkipUnmerged,
 }
 
+impl CleanupDisposition {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            CleanupDisposition::SafeDelete => "SafeDelete",
+            CleanupDisposition::SkipCurrent => "SkipCurrent",
+            CleanupDisposition::SkipMain => "SkipMain",
+            CleanupDisposition::SkipDirty => "SkipDirty",
+            CleanupDisposition::SkipUnmerged => "SkipUnmerged",
+        }
+    }
+}
+
 pub fn classify_cleanup_candidate(input: &CleanupInput) -> CleanupDisposition {
     if input.is_current_worktree {
         return CleanupDisposition::SkipCurrent;
@@ -117,10 +129,13 @@ where
 }
 
 fn should_cleanup_candidate(input: &CleanupInput, force: bool) -> bool {
-    match classify_cleanup_candidate(input) {
+    eligible_for(classify_cleanup_candidate(input), input, force)
+}
+
+fn eligible_for(disposition: CleanupDisposition, input: &CleanupInput, force: bool) -> bool {
+    match disposition {
         CleanupDisposition::SafeDelete => true,
-        CleanupDisposition::SkipCurrent => false,
-        CleanupDisposition::SkipMain => false,
+        CleanupDisposition::SkipCurrent | CleanupDisposition::SkipMain => false,
         CleanupDisposition::SkipDirty => force && is_stale_or_merged(input),
         CleanupDisposition::SkipUnmerged => force && input.upstream_gone,
     }
@@ -287,11 +302,13 @@ fn print_cleanup_candidates(inputs: &[&CleanupInput], force: bool) {
             "", "", "", "", "", ""
         );
         for (index, input) in inputs.iter().enumerate() {
+            let disposition = classify_cleanup_candidate(input);
+            let tone = tone_for(disposition, requires_force_for(disposition, input));
             println!(
                 "{:<4} {:<34} {} {:<18} {:<28} {}",
                 index + 1,
                 input.branch,
-                color_cleanup_disposition(input, 16),
+                color_disposition(disposition, tone, 16),
                 cleanup_reason(input),
                 cleanup_path(input),
                 cleanup_action(input, force)
@@ -304,7 +321,7 @@ fn print_cleanup_candidates(inputs: &[&CleanupInput], force: bool) {
                 "  {}. {}\t{}\t{}\t{}",
                 index + 1,
                 input.branch,
-                cleanup_disposition(input),
+                classify_cleanup_candidate(input).as_str(),
                 cleanup_reason(input),
                 cleanup_action(input, force)
             );
@@ -326,12 +343,11 @@ fn cleanup_reasons(input: &CleanupInput) -> Vec<&'static str> {
     if input.upstream_gone {
         values.push("gone");
     }
-    if input.merged_to_default {
-        values.push("merged");
-    }
-    if !input.merged_to_default {
-        values.push("unmerged");
-    }
+    values.push(if input.merged_to_default {
+        "merged"
+    } else {
+        "unmerged"
+    });
     if input.is_dirty {
         values.push("dirty");
     }
@@ -416,7 +432,7 @@ fn run_cleanup_selector(inputs: &[&CleanupInput], force: bool) -> Result<Vec<usi
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct CleanupRow {
     branch: String,
-    disposition: String,
+    disposition: &'static str,
     reason: String,
     path: String,
     action: String,
@@ -434,13 +450,17 @@ impl CleanupSelectorState {
     fn new(inputs: &[&CleanupInput], force: bool) -> Self {
         let rows: Vec<CleanupRow> = inputs
             .iter()
-            .map(|input| CleanupRow {
-                branch: input.branch.clone(),
-                disposition: cleanup_disposition(input),
-                reason: cleanup_reason(input),
-                path: cleanup_path(input),
-                action: cleanup_action(input, force),
-                tone: cleanup_tone(input),
+            .map(|input| {
+                let disposition = classify_cleanup_candidate(input);
+                let requires_force = requires_force_for(disposition, input);
+                CleanupRow {
+                    branch: input.branch.clone(),
+                    disposition: disposition.as_str(),
+                    reason: cleanup_reason(input),
+                    path: cleanup_path(input),
+                    action: cleanup_action(input, force),
+                    tone: tone_for(disposition, requires_force),
+                }
             })
             .collect();
         Self {
@@ -565,7 +585,7 @@ fn render_cleanup_selector(frame: &mut Frame<'_>, state: &CleanupSelectorState) 
         Row::new([
             Cell::from(checkbox),
             Cell::from(row.branch.as_str()).style(tone_style(row.tone)),
-            Cell::from(row.disposition.as_str()).style(tone_style(row.tone)),
+            Cell::from(row.disposition).style(tone_style(row.tone)),
             Cell::from(row.reason.as_str()).style(tone_style(row.tone)),
             Cell::from(row.path.as_str()).style(tone_style(if row.path == "-" {
                 Tone::Dim
@@ -600,7 +620,7 @@ fn render_cleanup_selector(frame: &mut Frame<'_>, state: &CleanupSelectorState) 
         .map(|row| {
             vec![
                 label_line("Branch  ", row.branch.as_str()),
-                label_line("State   ", row.disposition.as_str()),
+                label_line("State   ", row.disposition),
                 label_line("Reason  ", row.reason.as_str()),
                 label_line("Path    ", row.path.as_str()),
                 label_line("Action  ", row.action.as_str()),
@@ -660,35 +680,41 @@ struct CleanupRecord<'a> {
 fn print_cleanup_json(inputs: &[CleanupInput], force: bool) -> Result<()> {
     let values: Vec<CleanupRecord> = inputs
         .iter()
-        .map(|input| CleanupRecord {
-            branch: input.branch.as_str(),
-            worktree_path: input.worktree_path.as_deref(),
-            disposition: classify_cleanup_candidate(input),
-            upstream_gone: input.upstream_gone,
-            merged_to_default: input.merged_to_default,
-            dirty: input.is_dirty,
-            current: input.is_current_worktree,
-            main_worktree: input.is_main_worktree,
-            reasons: cleanup_reasons(input),
-            eligible: should_cleanup_candidate(input, force),
-            requires_force: cleanup_requires_force(input),
-            action: if should_cleanup_candidate(input, force) {
-                cleanup_action(input, force)
+        .map(|input| {
+            let disposition = classify_cleanup_candidate(input);
+            let eligible_no_force = eligible_for(disposition, input, false);
+            let eligible_with_force = eligible_for(disposition, input, true);
+            let eligible = if force {
+                eligible_with_force
             } else {
-                "skip".to_string()
-            },
+                eligible_no_force
+            };
+            CleanupRecord {
+                branch: input.branch.as_str(),
+                worktree_path: input.worktree_path.as_deref(),
+                disposition,
+                upstream_gone: input.upstream_gone,
+                merged_to_default: input.merged_to_default,
+                dirty: input.is_dirty,
+                current: input.is_current_worktree,
+                main_worktree: input.is_main_worktree,
+                reasons: cleanup_reasons(input),
+                eligible,
+                requires_force: !eligible_no_force && eligible_with_force,
+                action: if eligible {
+                    cleanup_action(input, force)
+                } else {
+                    "skip".to_string()
+                },
+            }
         })
         .collect();
     println!("{}", serde_json::to_string_pretty(&values)?);
     Ok(())
 }
 
-fn cleanup_disposition(input: &CleanupInput) -> String {
-    format!("{:?}", classify_cleanup_candidate(input))
-}
-
-fn cleanup_requires_force(input: &CleanupInput) -> bool {
-    !should_cleanup_candidate(input, false) && should_cleanup_candidate(input, true)
+fn requires_force_for(disposition: CleanupDisposition, input: &CleanupInput) -> bool {
+    !eligible_for(disposition, input, false) && eligible_for(disposition, input, true)
 }
 
 fn cleanup_action(input: &CleanupInput, force: bool) -> String {
@@ -705,26 +731,26 @@ fn cleanup_action(input: &CleanupInput, force: bool) -> String {
     }
 }
 
-fn cleanup_tone(input: &CleanupInput) -> Tone {
-    match classify_cleanup_candidate(input) {
+fn tone_for(disposition: CleanupDisposition, requires_force: bool) -> Tone {
+    match disposition {
         CleanupDisposition::SafeDelete => Tone::Good,
         CleanupDisposition::SkipDirty => Tone::Dirty,
-        CleanupDisposition::SkipUnmerged if cleanup_requires_force(input) => Tone::Warning,
+        CleanupDisposition::SkipUnmerged if requires_force => Tone::Warning,
         CleanupDisposition::SkipCurrent
         | CleanupDisposition::SkipMain
         | CleanupDisposition::SkipUnmerged => Tone::Bad,
     }
 }
 
-fn color_cleanup_disposition(input: &CleanupInput, width: usize) -> String {
-    let code = match cleanup_tone(input) {
+fn color_disposition(disposition: CleanupDisposition, tone: Tone, width: usize) -> String {
+    let code = match tone {
         Tone::Good => 32,
         Tone::Warning => 33,
         Tone::Dirty => 35,
         Tone::Bad => 31,
         _ => 2,
     };
-    format!("\x1b[{code}m{:<width$}\x1b[0m", cleanup_disposition(input))
+    format!("\x1b[{code}m{:<width$}\x1b[0m", disposition.as_str())
 }
 
 #[cfg(test)]

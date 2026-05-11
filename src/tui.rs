@@ -17,7 +17,7 @@ use ratatui::{Frame, Terminal};
 pub(crate) const HIGHLIGHT_SYMBOL: &str = "› ";
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) enum Tone {
+pub enum Tone {
     Default,
     Dim,
     Worktree,
