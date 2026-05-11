@@ -39,8 +39,6 @@ pub struct PullRequestListItem {
     pub is_draft: bool,
     #[serde(default, rename = "reviewDecision")]
     pub review_decision: Option<String>,
-    #[serde(default)]
-    pub labels: Vec<GitHubLabel>,
     #[serde(default, rename = "updatedAt")]
     pub updated_at: Option<String>,
 }
@@ -155,7 +153,7 @@ pub fn list_open_prs() -> Result<Vec<PullRequestListItem>> {
         "--limit",
         "100",
         "--json",
-        "number,title,headRefName,isCrossRepository,author,baseRefName,isDraft,reviewDecision,labels,updatedAt",
+        "number,title,headRefName,isCrossRepository,author,baseRefName,isDraft,reviewDecision,updatedAt",
     ])
 }
 

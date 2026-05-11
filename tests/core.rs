@@ -9,7 +9,7 @@ use git_ws::candidates::{
 };
 use git_ws::cleanup::{CleanupDisposition, CleanupInput, classify_cleanup_candidate};
 use git_ws::config::{FileConfig, GitConfig, load_file_config, resolve_base_dir};
-use git_ws::git::{Worktree, parse_worktree_porcelain};
+use git_ws::git::{LocalBranch, Worktree, parse_worktree_porcelain};
 use git_ws::github::{
     IssueListItem, PullRequestListItem, issue_picker_entries, pr_picker_entries, slugify_title,
 };
@@ -101,12 +101,12 @@ fn merges_worktree_local_and_remote_candidates_by_branch_name() {
             branch: Some("feature/demo".to_string()),
             is_main: false,
         }],
-        vec![(
-            "feature/demo".to_string(),
-            Some("origin/feature/demo".to_string()),
-            None,
-            "abc1234".to_string(),
-        )],
+        vec![LocalBranch {
+            name: "feature/demo".to_string(),
+            upstream: Some("origin/feature/demo".to_string()),
+            track: None,
+            head: "abc1234".to_string(),
+        }],
         vec![(
             "feature/demo".to_string(),
             "origin/feature/demo".to_string(),
@@ -504,7 +504,6 @@ fn parses_github_pr_list_and_builds_picker_entries() {
             base_ref_name: None,
             is_draft: false,
             review_decision: None,
-            labels: vec![],
             updated_at: None,
         }]
     );

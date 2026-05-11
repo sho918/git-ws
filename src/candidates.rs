@@ -251,15 +251,16 @@ pub fn merge_candidates(
         candidate.worktree_head = worktree.head;
     }
 
-    for (branch, upstream, track, head) in local_branches {
+    for local_branch in local_branches {
         let candidate = candidates
-            .entry(local_candidate_key(&branch))
-            .or_insert_with(|| Candidate::new(branch.clone()));
-        let has_upstream = upstream.is_some();
-        candidate.local_ref = Some(branch);
-        candidate.upstream = upstream;
-        candidate.local_head = Some(head);
-        candidate.tracking = TrackingInfo::from_git_track(track.as_deref(), has_upstream);
+            .entry(local_candidate_key(&local_branch.name))
+            .or_insert_with(|| Candidate::new(local_branch.name.clone()));
+        let has_upstream = local_branch.upstream.is_some();
+        candidate.local_ref = Some(local_branch.name);
+        candidate.upstream = local_branch.upstream;
+        candidate.local_head = Some(local_branch.head);
+        candidate.tracking =
+            TrackingInfo::from_git_track(local_branch.track.as_deref(), has_upstream);
     }
 
     for (name, remote_ref, head) in remote_branches {

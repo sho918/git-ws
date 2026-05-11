@@ -20,7 +20,13 @@ pub struct Repo {
     pub root: PathBuf,
 }
 
-pub type LocalBranch = (String, Option<String>, Option<String>, String);
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct LocalBranch {
+    pub name: String,
+    pub upstream: Option<String>,
+    pub track: Option<String>,
+    pub head: String,
+}
 
 pub fn ensure_repo() -> Result<Repo> {
     let root = git_output(["rev-parse", "--show-toplevel"])?;
@@ -180,7 +186,12 @@ pub fn list_local_branches() -> Result<Vec<LocalBranch>> {
                 .filter(|value| !value.is_empty())
                 .map(ToString::to_string);
             let head = parts.next().unwrap_or_default().to_string();
-            Some((branch, upstream, track, head))
+            Some(LocalBranch {
+                name: branch,
+                upstream,
+                track,
+                head,
+            })
         })
         .collect())
 }

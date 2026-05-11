@@ -591,6 +591,6 @@ Run open, issue, or pr without a target to use the interactive fuzzy picker.
 TTY views show colored status columns; non-TTY and JSON output stay plain.
 list --json adds tracking/action fields; cleanup --json adds eligibility/action fields.
 Use `git ws open --type remote` to pick from remote branches only.
- "#
+"#
     );
 }
