@@ -17,6 +17,7 @@ use crate::git::{
     current_worktree_root, default_branch, git_output, git_output_bytes, git_status,
     list_worktrees, list_worktrees_with_prunable, local_branch_name, prune_worktrees,
 };
+use crate::github::load_branch_pull_requests;
 use crate::path_to_str;
 use crate::tui::{
     self, HIGHLIGHT_SYMBOL, NavCommand, Outcome, Tone, TuiTerminal, header_style, label_line,
@@ -191,7 +192,7 @@ pub fn discover_cleanup_candidates() -> Result<Vec<CleanupInput>> {
         .filter_map(|worktree| worktree.branch.as_deref().map(|branch| (branch, worktree)))
         .collect();
 
-    Ok(local
+    let mut inputs: Vec<_> = local
         .into_iter()
         .filter(|(branch, _upstream_gone)| !protected.contains(branch))
         .map(|(branch, upstream_gone)| {
@@ -212,7 +213,28 @@ pub fn discover_cleanup_candidates() -> Result<Vec<CleanupInput>> {
                 is_dirty,
             }
         })
-        .collect())
+        .collect();
+    mark_github_merged_candidates(&mut inputs, default_local);
+    Ok(inputs)
+}
+
+fn mark_github_merged_candidates(inputs: &mut [CleanupInput], default_local: &str) {
+    let branches: Vec<String> = inputs
+        .iter()
+        .filter(|input| input.upstream_gone && !input.merged_to_default)
+        .map(|input| input.branch.clone())
+        .collect();
+    let Ok(pull_requests) = load_branch_pull_requests(&branches, false) else {
+        return;
+    };
+    for input in inputs {
+        if pull_requests
+            .get(&input.branch)
+            .is_some_and(|pull_request| pull_request.is_merged_into(default_local))
+        {
+            input.merged_to_default = true;
+        }
+    }
 }
 
 fn check_worktrees_dirty(worktrees: &[crate::git::Worktree]) -> HashMap<PathBuf, bool> {
