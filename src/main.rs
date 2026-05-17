@@ -1,3 +1,4 @@
+use std::collections::HashMap;
 use std::env;
 use std::ffi::OsString;
 use std::io::{self, IsTerminal};
@@ -11,8 +12,8 @@ use git_ws::git::{
     remote_tracking_ref_for_branch, remote_tracking_refname,
 };
 use git_ws::github::{
-    create_issue_worktree, create_pr_worktree, issue_picker_entries, list_open_issues,
-    list_open_prs, pr_picker_entries,
+    BranchPullRequestInfo, create_issue_worktree, create_pr_worktree, issue_picker_entries,
+    list_open_issues, list_open_prs, load_branch_pull_requests, pr_picker_entries,
 };
 use git_ws::picker::{PickerView, pick_candidate, pick_entry};
 use git_ws::shell::init_script;
@@ -133,24 +134,56 @@ fn cmd_open(args: Vec<OsString>) -> Result<()> {
 }
 
 fn cmd_list(args: Vec<OsString>) -> Result<()> {
-    let ListArgs { filter, json } = parse_list_args(args)?;
+    let ListArgs {
+        filter,
+        json,
+        prs,
+        refresh_prs,
+    } = parse_list_args(args)?;
     let candidates = load_candidates(filter)?;
+    let pull_requests = if prs {
+        match load_candidate_pull_requests(&candidates, refresh_prs) {
+            Ok(values) => Some(values),
+            Err(error) => {
+                eprintln!("git-ws: PR lookup failed: {error:#}");
+                Some(HashMap::new())
+            }
+        }
+    } else {
+        None
+    };
     if json {
-        print_candidates_json(&candidates)?;
+        print_candidates_json(&candidates, pull_requests.as_ref())?;
     } else if io::stdout().is_terminal() {
-        print_candidate_table(&candidates);
+        print_candidate_table(&candidates, pull_requests.as_ref());
     } else {
         for candidate in candidates {
-            println!(
-                "{}\t{}\t{}\t{}\t{}\t{}\t{}",
-                candidate.availability_label(),
-                candidate.name,
-                candidate.upstream_label(),
-                candidate.tracking.summary,
-                candidate.head_label(),
-                candidate.path_label(),
-                candidate.action_label()
-            );
+            if let Some(pull_requests) = pull_requests.as_ref() {
+                let pull_request = candidate_pull_request(&candidate, pull_requests);
+                println!(
+                    "{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}",
+                    candidate.availability_label(),
+                    candidate.name,
+                    candidate.upstream_label(),
+                    candidate.tracking.summary,
+                    candidate.head_label(),
+                    candidate.path_label(),
+                    pull_request_label(pull_request),
+                    pull_request_url(pull_request),
+                    candidate.action_label()
+                );
+            } else {
+                println!(
+                    "{}\t{}\t{}\t{}\t{}\t{}\t{}",
+                    candidate.availability_label(),
+                    candidate.name,
+                    candidate.upstream_label(),
+                    candidate.tracking.summary,
+                    candidate.head_label(),
+                    candidate.path_label(),
+                    candidate.action_label()
+                );
+            }
         }
     }
     Ok(())
@@ -300,27 +333,68 @@ fn cmd_doctor() -> Result<()> {
     Ok(())
 }
 
-fn print_candidate_table(candidates: &[Candidate]) {
+fn load_candidate_pull_requests(
+    candidates: &[Candidate],
+    refresh: bool,
+) -> Result<HashMap<String, BranchPullRequestInfo>> {
+    let branches: Vec<&str> = candidates
+        .iter()
+        .map(candidate_pull_request_branch)
+        .collect();
+    load_branch_pull_requests(&branches, refresh)
+}
+
+fn print_candidate_table(
+    candidates: &[Candidate],
+    pull_requests: Option<&HashMap<String, BranchPullRequestInfo>>,
+) {
     println!("git-ws worktrees");
-    println!(
-        "{:<12} {:<34} {:<28} {:<16} {:<10} {:<28} Action",
-        "Status", "Name", "Upstream", "Track", "Head", "Path"
-    );
-    println!(
-        "{:-<12} {:-<34} {:-<28} {:-<16} {:-<10} {:-<28} {:-<1}",
-        "", "", "", "", "", "", ""
-    );
-    for candidate in candidates {
+    if pull_requests.is_some() {
         println!(
-            "{} {:<34} {} {} {:<10} {} {}",
-            color_candidate_status(candidate, 12),
-            candidate.name,
-            color_remote(candidate.upstream_label(), 28),
-            color_tracking(candidate, 16),
-            candidate.head_label(),
-            color_path(candidate, 28),
-            color_info(&candidate.action_label())
+            "{:<12} {:<34} {:<28} {:<16} {:<10} {:<28} {:<12} {:<36} Action",
+            "Status", "Name", "Upstream", "Track", "Head", "Path", "PR", "URL"
         );
+        println!(
+            "{:-<12} {:-<34} {:-<28} {:-<16} {:-<10} {:-<28} {:-<12} {:-<36} {:-<1}",
+            "", "", "", "", "", "", "", "", ""
+        );
+    } else {
+        println!(
+            "{:<12} {:<34} {:<28} {:<16} {:<10} {:<28} Action",
+            "Status", "Name", "Upstream", "Track", "Head", "Path"
+        );
+        println!(
+            "{:-<12} {:-<34} {:-<28} {:-<16} {:-<10} {:-<28} {:-<1}",
+            "", "", "", "", "", "", ""
+        );
+    }
+    for candidate in candidates {
+        if let Some(pull_requests) = pull_requests {
+            let pull_request = candidate_pull_request(candidate, pull_requests);
+            println!(
+                "{} {:<34} {} {} {:<10} {} {} {:<36} {}",
+                color_candidate_status(candidate, 12),
+                candidate.name,
+                color_remote(candidate.upstream_label(), 28),
+                color_tracking(candidate, 16),
+                candidate.head_label(),
+                color_path(candidate, 28),
+                color_pull_request(pull_request, 12),
+                pull_request_url(pull_request),
+                color_info(&candidate.action_label())
+            );
+        } else {
+            println!(
+                "{} {:<34} {} {} {:<10} {} {}",
+                color_candidate_status(candidate, 12),
+                candidate.name,
+                color_remote(candidate.upstream_label(), 28),
+                color_tracking(candidate, 16),
+                candidate.head_label(),
+                color_path(candidate, 28),
+                color_info(&candidate.action_label())
+            );
+        }
     }
 }
 
@@ -328,14 +402,21 @@ fn print_candidate_table(candidates: &[Candidate]) {
 struct CandidateRecord<'a> {
     #[serde(flatten)]
     candidate: &'a Candidate,
+    #[serde(rename = "pullRequest", skip_serializing_if = "Option::is_none")]
+    pull_request: Option<&'a BranchPullRequestInfo>,
     action: String,
 }
 
-fn print_candidates_json(candidates: &[Candidate]) -> Result<()> {
+fn print_candidates_json(
+    candidates: &[Candidate],
+    pull_requests: Option<&HashMap<String, BranchPullRequestInfo>>,
+) -> Result<()> {
     let records: Vec<_> = candidates
         .iter()
         .map(|candidate| CandidateRecord {
             candidate,
+            pull_request: pull_requests
+                .and_then(|values| candidate_pull_request(candidate, values)),
             action: candidate.action_label(),
         })
         .collect();
@@ -380,6 +461,44 @@ fn color_path(candidate: &Candidate, width: usize) -> String {
     } else {
         color_padded("-", 2, width)
     }
+}
+
+fn candidate_pull_request<'a>(
+    candidate: &Candidate,
+    pull_requests: &'a HashMap<String, BranchPullRequestInfo>,
+) -> Option<&'a BranchPullRequestInfo> {
+    pull_requests.get(candidate_pull_request_branch(candidate))
+}
+
+fn candidate_pull_request_branch(candidate: &Candidate) -> &str {
+    candidate
+        .local_ref
+        .as_deref()
+        .unwrap_or(candidate.name.as_str())
+}
+
+fn pull_request_label(pull_request: Option<&BranchPullRequestInfo>) -> String {
+    pull_request
+        .map(BranchPullRequestInfo::label)
+        .unwrap_or_else(|| "-".to_string())
+}
+
+fn pull_request_url(pull_request: Option<&BranchPullRequestInfo>) -> &str {
+    pull_request.map(|value| value.url.as_str()).unwrap_or("-")
+}
+
+fn color_pull_request(pull_request: Option<&BranchPullRequestInfo>, width: usize) -> String {
+    let Some(pull_request) = pull_request else {
+        return color_padded("-", 2, width);
+    };
+    let code = match pull_request.state.as_str() {
+        "merged" => 32,
+        "open" => 36,
+        "draft" => 33,
+        "closed" => 31,
+        _ => 2,
+    };
+    color_padded(&pull_request.label(), code, width)
 }
 
 fn color_info(value: &str) -> String {
@@ -461,12 +580,16 @@ fn parse_open_args(args: Vec<OsString>) -> Result<OpenArgs> {
 struct ListArgs {
     filter: CandidateFilter,
     json: bool,
+    prs: bool,
+    refresh_prs: bool,
 }
 
 fn parse_list_args(args: Vec<OsString>) -> Result<ListArgs> {
     let mut parser = lexopt::Parser::from_args(args);
     let mut filter = CandidateFilter::All;
     let mut json = false;
+    let mut prs = false;
+    let mut refresh_prs = false;
     while let Some(arg) = parser.next()? {
         match arg {
             Long("type") => {
@@ -475,10 +598,20 @@ fn parse_list_args(args: Vec<OsString>) -> Result<ListArgs> {
                     .ok_or_else(|| anyhow!("unknown type: {value}"))?;
             }
             Long("json") => json = true,
+            Long("prs") => prs = true,
+            Long("refresh-prs") => {
+                prs = true;
+                refresh_prs = true;
+            }
             _ => return Err(arg.unexpected().into()),
         }
     }
-    Ok(ListArgs { filter, json })
+    Ok(ListArgs {
+        filter,
+        json,
+        prs,
+        refresh_prs,
+    })
 }
 
 #[derive(Debug)]
@@ -600,7 +733,7 @@ fn print_help() {
 
 Usage:
   git ws [open] [query] [--type all|worktree|local|remote]
-  git ws list [--json] [--type all|worktree|local|remote]
+  git ws list [--json] [--prs] [--refresh-prs] [--type all|worktree|local|remote]
   git ws new <branch> [--from <ref>] [--path <path>] [--no-init]
   git ws issue [number|url] [--base <ref>] [--branch <name>] [--no-init]
   git ws pr [number|url] [--branch <name>] [--no-init] [--force]
@@ -611,7 +744,8 @@ Usage:
 
 Run open, issue, or pr without a target to use the interactive fuzzy picker.
 TTY views show colored status columns; non-TTY and JSON output stay plain.
-list --json adds tracking/action fields; cleanup --json adds eligibility/action fields.
+list --json adds tracking/action fields; list --prs adds PR status/URL with a short cache.
+cleanup --json adds eligibility/action fields.
 Use `git ws open --type remote` to pick from remote branches only.
 "#
     );

@@ -43,7 +43,7 @@ eval "$(git ws init-shell zsh)"
 
 ```sh
 git ws [open] [query] [--type all|worktree|local|remote]
-git ws list [--json] [--type all|worktree|local|remote]
+git ws list [--json] [--prs] [--refresh-prs] [--type all|worktree|local|remote]
 git ws new <branch> [--from <ref>] [--path <path>] [--no-init]
 git ws issue [number|url] [--base <ref>] [--branch <name>] [--no-init]
 git ws pr [number|url] [--branch <name>] [--no-init]
@@ -63,7 +63,7 @@ git ws open --type remote
 Interactive and TTY table views show dense columns for the selected workflow:
 
 - `git ws` and `git ws list`: status, branch name, upstream, tracking state,
-  head, path, and action.
+  head, path, and action. `git ws list --prs` also shows PR status and URL.
 - `git ws issue`: number, title, author, labels, updated date, and planned
   branch.
 - `git ws pr`: number, title, author, head, base, review state, and updated
@@ -71,12 +71,16 @@ Interactive and TTY table views show dense columns for the selected workflow:
 - `git ws cleanup`: deletion selection, branch, disposition, reasons, path, and
   action.
 
-TTY views use color as a secondary signal: worktrees are green, local branches
-yellow, remote refs cyan, stale or blocked states red, behind/diverged states
-magenta, and ahead states blue. Non-TTY output and JSON never include ANSI color
+TTY views use color as a secondary signal: worktrees and merged PRs are green,
+local branches and draft PRs are yellow, remote refs and open PRs are cyan,
+stale, closed, or blocked states are red, behind/diverged states are magenta,
+and ahead states are blue. Non-TTY output and JSON never include ANSI color
 codes.
 
 `git ws list --json` keeps the existing fields and adds `tracking` and `action`.
+When `--prs` is set, list output includes PR status and URL. PR lookups are
+cached for five minutes under `$XDG_CACHE_HOME/git-ws/pr-cache-v1` or
+`$HOME/.cache/git-ws/pr-cache-v1`; use `--refresh-prs` to bypass the cache.
 `git ws cleanup --json` keeps the existing fields and adds `reasons`,
 `eligible`, `requiresForce`, and `action`.
 
