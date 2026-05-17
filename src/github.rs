@@ -1,9 +1,9 @@
-use std::collections::{HashMap, HashSet};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::env;
 use std::fs;
 use std::path::PathBuf;
 use std::process::Command;
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::time::SystemTime;
 
 use anyhow::{Context, Result, anyhow};
 use serde::{Deserialize, Serialize};
@@ -71,6 +71,8 @@ pub struct BranchPullRequestInfo {
     pub number: u64,
     pub title: String,
     pub head_ref_name: String,
+    pub head_ref_oid: Option<String>,
+    pub head_repository: Option<String>,
     pub base_ref_name: Option<String>,
     pub state: String,
     pub is_draft: bool,
@@ -88,6 +90,15 @@ impl BranchPullRequestInfo {
     pub fn is_merged_into(&self, base: &str) -> bool {
         self.state == "merged" && self.base_ref_name.as_deref() == Some(base)
     }
+
+    pub fn is_merged_into_head(&self, base: &str, repository: &str, head_oid: &str) -> bool {
+        self.is_merged_into(base)
+            && self.head_ref_oid.as_deref() == Some(head_oid)
+            && self
+                .head_repository
+                .as_deref()
+                .is_some_and(|head_repository| head_repository.eq_ignore_ascii_case(repository))
+    }
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
@@ -96,6 +107,10 @@ struct RawBranchPullRequest {
     number: u64,
     title: String,
     head_ref_name: String,
+    #[serde(default)]
+    head_ref_oid: Option<String>,
+    #[serde(default)]
+    head_repository: Option<RawRepository>,
     #[serde(default)]
     base_ref_name: Option<String>,
     state: String,
@@ -112,9 +127,14 @@ struct RawBranchPullRequest {
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
 #[serde(rename_all = "camelCase")]
+struct RawRepository {
+    name_with_owner: String,
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize)]
+#[serde(rename_all = "camelCase")]
 struct PullRequestCache {
-    fetched_at: u64,
-    pull_requests: Vec<BranchPullRequestInfo>,
+    branches: BTreeMap<String, Vec<BranchPullRequestInfo>>,
 }
 
 const PR_CACHE_TTL_SECS: u64 = 300;
@@ -218,28 +238,31 @@ pub fn list_open_prs() -> Result<Vec<PullRequestListItem>> {
 }
 
 pub fn load_branch_pull_requests(
-    branches: &[String],
+    branches: &[&str],
     refresh: bool,
 ) -> Result<HashMap<String, BranchPullRequestInfo>> {
+    let branches = requested_branch_names(branches);
     if branches.is_empty() {
         return Ok(HashMap::new());
     }
     let Some(repository) = current_git_remote_repository()? else {
         return Ok(HashMap::new());
     };
-    let pull_requests = if !refresh {
-        read_fresh_pr_cache(&repository).unwrap_or_else(|| {
-            let values = fetch_branch_pull_requests(&repository)?;
-            write_pr_cache(&repository, &values).ok();
-            Ok(values)
-        })?
-    } else {
-        let values = fetch_branch_pull_requests(&repository)?;
-        write_pr_cache(&repository, &values).ok();
-        values
-    };
+    let pull_requests =
+        if !refresh && let Some(cached) = read_fresh_pr_cache(&repository, &branches) {
+            cached?
+        } else {
+            let cache = fetch_branch_pull_requests(&repository, &branches)?;
+            let values = flatten_cached_pull_requests(&cache, &branches);
+            write_pr_cache(&repository, cache).ok();
+            values
+        };
 
-    Ok(pull_requests_by_branch(branches, pull_requests))
+    Ok(pull_requests_by_branch(
+        &branches,
+        &repository,
+        pull_requests,
+    ))
 }
 
 pub fn issue_picker_entries(issues: &[IssueListItem]) -> Vec<PickerEntry<String>> {
@@ -386,18 +409,49 @@ fn gh_json<const N: usize, T: for<'de> Deserialize<'de>>(args: [&str; N]) -> Res
     serde_json::from_slice(&output.stdout).context("failed to parse gh JSON")
 }
 
-fn fetch_branch_pull_requests(repository: &str) -> Result<Vec<BranchPullRequestInfo>> {
+fn requested_branch_names(branches: &[&str]) -> Vec<String> {
+    let mut values: Vec<String> = branches
+        .iter()
+        .copied()
+        .filter(|branch| !branch.is_empty())
+        .map(ToString::to_string)
+        .collect();
+    values.sort();
+    values.dedup();
+    values
+}
+
+fn fetch_branch_pull_requests(
+    repository: &str,
+    branches: &[String],
+) -> Result<BTreeMap<String, Vec<BranchPullRequestInfo>>> {
+    let mut values = BTreeMap::new();
+    for branch in branches {
+        values.insert(
+            branch.clone(),
+            fetch_branch_pull_requests_for_head(repository, branch)?,
+        );
+    }
+    Ok(values)
+}
+
+fn fetch_branch_pull_requests_for_head(
+    repository: &str,
+    branch: &str,
+) -> Result<Vec<BranchPullRequestInfo>> {
     let raw: Vec<RawBranchPullRequest> = gh_json([
         "pr",
         "list",
         "-R",
         repository,
+        "--head",
+        branch,
         "--state",
         "all",
         "--limit",
         "100",
         "--json",
-        "number,title,headRefName,baseRefName,state,isDraft,mergedAt,closedAt,updatedAt,url",
+        "number,title,headRefName,headRefOid,headRepository,baseRefName,state,isDraft,mergedAt,closedAt,updatedAt,url",
     ])?;
     Ok(raw.into_iter().map(normalize_branch_pr).collect())
 }
@@ -412,6 +466,10 @@ fn normalize_branch_pr(raw: RawBranchPullRequest) -> BranchPullRequestInfo {
         number: raw.number,
         title: raw.title,
         head_ref_name: raw.head_ref_name,
+        head_ref_oid: raw.head_ref_oid,
+        head_repository: raw
+            .head_repository
+            .map(|repository| repository.name_with_owner),
         base_ref_name: raw.base_ref_name,
         state,
         is_draft: raw.is_draft,
@@ -424,29 +482,45 @@ fn normalize_branch_pr(raw: RawBranchPullRequest) -> BranchPullRequestInfo {
 
 fn pull_requests_by_branch(
     branches: &[String],
+    repository: &str,
     pull_requests: Vec<BranchPullRequestInfo>,
 ) -> HashMap<String, BranchPullRequestInfo> {
     let wanted: HashSet<&str> = branches.iter().map(String::as_str).collect();
-    let mut values = HashMap::new();
+    let mut values: HashMap<String, BranchPullRequestInfo> = HashMap::new();
     for pull_request in pull_requests {
         if !wanted.contains(pull_request.head_ref_name.as_str()) {
             continue;
         }
-        values
-            .entry(pull_request.head_ref_name.clone())
-            .and_modify(|current| {
-                if better_branch_pr(&pull_request, current) {
-                    *current = pull_request.clone();
-                }
-            })
-            .or_insert(pull_request);
+        if let Some(current) = values.get(pull_request.head_ref_name.as_str())
+            && !better_branch_pr(&pull_request, current, repository)
+        {
+            continue;
+        }
+        values.insert(pull_request.head_ref_name.clone(), pull_request);
     }
     values
 }
 
-fn better_branch_pr(left: &BranchPullRequestInfo, right: &BranchPullRequestInfo) -> bool {
-    pr_state_rank(left) > pr_state_rank(right)
-        || (pr_state_rank(left) == pr_state_rank(right) && left.updated_at > right.updated_at)
+fn better_branch_pr(
+    left: &BranchPullRequestInfo,
+    right: &BranchPullRequestInfo,
+    repository: &str,
+) -> bool {
+    let left_same_repository = is_same_head_repository(left, repository);
+    let right_same_repository = is_same_head_repository(right, repository);
+    if left_same_repository != right_same_repository {
+        return left_same_repository;
+    }
+    let left_rank = pr_state_rank(left);
+    let right_rank = pr_state_rank(right);
+    left_rank > right_rank || (left_rank == right_rank && left.updated_at > right.updated_at)
+}
+
+fn is_same_head_repository(value: &BranchPullRequestInfo, repository: &str) -> bool {
+    value
+        .head_repository
+        .as_deref()
+        .is_some_and(|head_repository| head_repository.eq_ignore_ascii_case(repository))
 }
 
 fn pr_state_rank(value: &BranchPullRequestInfo) -> u8 {
@@ -458,7 +532,7 @@ fn pr_state_rank(value: &BranchPullRequestInfo) -> u8 {
     }
 }
 
-fn current_git_remote_repository() -> Result<Option<String>> {
+pub fn current_git_remote_repository() -> Result<Option<String>> {
     let output = git_output(["remote", "-v"])?;
     Ok(output.lines().find_map(|line| {
         let mut parts = line.split_whitespace();
@@ -469,18 +543,43 @@ fn current_git_remote_repository() -> Result<Option<String>> {
     }))
 }
 
-fn read_fresh_pr_cache(repository: &str) -> Option<Result<Vec<BranchPullRequestInfo>>> {
+fn read_fresh_pr_cache(
+    repository: &str,
+    branches: &[String],
+) -> Option<Result<Vec<BranchPullRequestInfo>>> {
     let path = pr_cache_path(repository)?;
+    let modified = fs::metadata(&path)
+        .and_then(|metadata| metadata.modified())
+        .ok()?;
+    let age = SystemTime::now().duration_since(modified).ok()?;
+    if age.as_secs() > PR_CACHE_TTL_SECS {
+        return None;
+    }
     let raw = fs::read(&path).ok()?;
-    let cache: PullRequestCache = match serde_json::from_slice(&raw) {
-        Ok(cache) => cache,
-        Err(error) => return Some(Err(error).context("failed to parse PR cache")),
-    };
-    let now = unix_secs();
-    (now.saturating_sub(cache.fetched_at) <= PR_CACHE_TTL_SECS).then_some(Ok(cache.pull_requests))
+    match serde_json::from_slice::<PullRequestCache>(&raw) {
+        Ok(cache) => branches
+            .iter()
+            .all(|branch| cache.branches.contains_key(branch))
+            .then(|| Ok(flatten_cached_pull_requests(&cache.branches, branches))),
+        Err(error) => Some(Err(error).context("failed to parse PR cache")),
+    }
 }
 
-fn write_pr_cache(repository: &str, pull_requests: &[BranchPullRequestInfo]) -> Result<()> {
+fn flatten_cached_pull_requests(
+    cache: &BTreeMap<String, Vec<BranchPullRequestInfo>>,
+    branches: &[String],
+) -> Vec<BranchPullRequestInfo> {
+    branches
+        .iter()
+        .filter_map(|branch| cache.get(branch))
+        .flat_map(|values| values.iter().cloned())
+        .collect()
+}
+
+fn write_pr_cache(
+    repository: &str,
+    branches: BTreeMap<String, Vec<BranchPullRequestInfo>>,
+) -> Result<()> {
     let Some(path) = pr_cache_path(repository) else {
         return Ok(());
     };
@@ -488,10 +587,7 @@ fn write_pr_cache(repository: &str, pull_requests: &[BranchPullRequestInfo]) -> 
         fs::create_dir_all(parent)
             .with_context(|| format!("failed to create {}", parent.display()))?;
     }
-    let cache = PullRequestCache {
-        fetched_at: unix_secs(),
-        pull_requests: pull_requests.to_vec(),
-    };
+    let cache = PullRequestCache { branches };
     let raw = serde_json::to_vec_pretty(&cache).context("failed to serialize PR cache")?;
     fs::write(&path, raw).with_context(|| format!("failed to write {}", path.display()))
 }
@@ -502,29 +598,13 @@ fn pr_cache_path(repository: &str) -> Option<PathBuf> {
         .or_else(|| env::var_os("HOME").map(|home| PathBuf::from(home).join(".cache")))?;
     Some(
         base.join("git-ws")
-            .join("pr-cache-v1")
+            .join("pr-cache-v3")
             .join(format!("{}.json", cache_key(repository))),
     )
 }
 
 fn cache_key(repository: &str) -> String {
-    repository
-        .chars()
-        .map(|ch| {
-            if ch.is_ascii_alphanumeric() || matches!(ch, '-' | '_') {
-                ch
-            } else {
-                '_'
-            }
-        })
-        .collect()
-}
-
-fn unix_secs() -> u64 {
-    SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .map(|duration| duration.as_secs())
-        .unwrap_or_default()
+    repository.replace('/', "_")
 }
 
 fn fetch_remote_for_current_repository() -> Result<String> {
@@ -595,22 +675,24 @@ fn repository_path_from_remote_url(url: &str) -> Option<String> {
 }
 
 fn github_repository_path_from_remote_url(url: &str) -> Option<String> {
-    let path = if let Some(path) = url.strip_prefix("git@").and_then(|value| {
-        let (host, path) = value.split_once(':')?;
-        (host == "github.com").then_some(path)
-    }) {
-        path
-    } else if let Some((_, rest)) = url.split_once("://") {
-        let (host, path) = rest.split_once('/')?;
-        let host = host.rsplit('@').next()?;
-        if host != "github.com" {
-            return None;
-        }
-        path
-    } else {
-        return None;
-    };
-    repository_path_from_remote_url(&format!("https://github.com/{path}"))
+    is_github_remote_url(url)
+        .then(|| repository_path_from_remote_url(url))
+        .flatten()
+}
+
+fn is_github_remote_url(url: &str) -> bool {
+    if let Some(rest) = url.strip_prefix("git@")
+        && let Some((host, _)) = rest.split_once(':')
+    {
+        return host == "github.com";
+    }
+    if let Some((_, rest)) = url.split_once("://")
+        && let Some((host_part, _)) = rest.split_once('/')
+    {
+        let host = host_part.rsplit('@').next().unwrap_or("");
+        return host == "github.com";
+    }
+    false
 }
 
 fn repository_path_from_pr_url(url: &str) -> Option<String> {

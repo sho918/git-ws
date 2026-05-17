@@ -619,6 +619,95 @@ exit 1
 }
 
 #[test]
+fn list_prs_prints_status_and_url_for_remote_only_branches() {
+    let repo = TestRepo::with_remote();
+    repo.create_remote_branch("feature/remote-only-pr");
+    git(repo.path(), ["branch", "-D", "feature/remote-only-pr"]);
+    git(
+        repo.path(),
+        [
+            "remote",
+            "add",
+            "github",
+            "https://github.com/owner/repo.git",
+        ],
+    );
+    let cache_home = tempfile::tempdir().expect("cache home");
+    let fake_bin = fake_gh(
+        r#"
+if [ "$1" = "pr" ] && [ "$2" = "list" ]; then
+  printf '[{"number":11,"title":"Remote PR","headRefName":"feature/remote-only-pr","baseRefName":"main","state":"OPEN","isDraft":false,"updatedAt":"2026-05-13T12:00:00Z","url":"https://github.com/owner/repo/pull/11"}]'
+  exit 0
+fi
+printf 'unexpected gh args: %s\n' "$*" >&2
+exit 1
+"#,
+    );
+
+    let output = Command::new(env!("CARGO_BIN_EXE_git-ws"))
+        .current_dir(repo.path())
+        .env("PATH", prepend_path(fake_bin.path()))
+        .env("XDG_CACHE_HOME", cache_home.path())
+        .args(["list", "--type", "remote", "--prs"])
+        .output()
+        .expect("run git-ws");
+
+    assert_success(&output);
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(
+        stdout.contains("feature/remote-only-pr\torigin/feature/remote-only-pr"),
+        "{stdout}"
+    );
+    assert!(stdout.contains("#11 open"), "{stdout}");
+    assert!(
+        stdout.contains("https://github.com/owner/repo/pull/11"),
+        "{stdout}"
+    );
+}
+
+#[test]
+fn list_prs_queries_each_head_branch_instead_of_only_the_first_repo_page() {
+    let repo = TestRepo::with_remote();
+    repo.create_remote_branch("feature/pr-head");
+    git(
+        repo.path(),
+        [
+            "remote",
+            "add",
+            "github",
+            "https://github.com/owner/repo.git",
+        ],
+    );
+    let cache_home = tempfile::tempdir().expect("cache home");
+    let fake_bin = fake_gh(
+        r#"
+if [ "$1" = "pr" ] && [ "$2" = "list" ] && [ "$6" = "feature/pr-head" ]; then
+    printf '[{"number":12,"title":"Head PR","headRefName":"feature/pr-head","baseRefName":"main","state":"OPEN","isDraft":false,"updatedAt":"2026-05-14T12:00:00Z","url":"https://github.com/owner/repo/pull/12"}]'
+    exit 0
+fi
+if [ "$1" = "pr" ] && [ "$2" = "list" ] && [ "$5" = "--head" ]; then
+  printf '[]'
+  exit 0
+fi
+printf 'expected branch-scoped gh lookup, got: %s\n' "$*" >&2
+exit 1
+"#,
+    );
+
+    let output = Command::new(env!("CARGO_BIN_EXE_git-ws"))
+        .current_dir(repo.path())
+        .env("PATH", prepend_path(fake_bin.path()))
+        .env("XDG_CACHE_HOME", cache_home.path())
+        .args(["list", "--type", "local", "--prs", "--refresh-prs"])
+        .output()
+        .expect("run git-ws");
+
+    assert_success(&output);
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(stdout.contains("#12 open"), "{stdout}");
+}
+
+#[test]
 fn list_prs_reuses_cached_pr_lookup() {
     let repo = TestRepo::with_remote();
     repo.create_remote_branch("feature/pr-cache");
@@ -635,9 +724,13 @@ fn list_prs_reuses_cached_pr_lookup() {
     let calls_path = cache_home.path().join("gh-calls");
     let fake_bin = fake_gh(&format!(
         r#"
-if [ "$1" = "pr" ] && [ "$2" = "list" ]; then
+if [ "$1" = "pr" ] && [ "$2" = "list" ] && [ "$6" = "feature/pr-cache" ]; then
   printf call >> '{}'
   printf '[{{"number":8,"title":"Cache PR","headRefName":"feature/pr-cache","baseRefName":"main","state":"MERGED","isDraft":false,"mergedAt":"2026-05-11T12:00:00Z","updatedAt":"2026-05-11T12:00:00Z","url":"https://github.com/owner/repo/pull/8"}}]'
+  exit 0
+fi
+if [ "$1" = "pr" ] && [ "$2" = "list" ] && [ "$5" = "--head" ]; then
+  printf '[]'
   exit 0
 fi
 printf 'unexpected gh args: %s\n' "$*" >&2
@@ -677,6 +770,10 @@ fn cleanup_yes_deletes_unmerged_gone_branch_when_merged_pr_matches_default() {
     fs::write(repo.path().join("local-only.txt"), "local\n").expect("write local change");
     git(repo.path(), ["add", "local-only.txt"]);
     git(repo.path(), ["commit", "-m", "local only"]);
+    let local_head =
+        String::from_utf8_lossy(&git(repo.path(), ["rev-parse", "feature/squash-merged"]).stdout)
+            .trim()
+            .to_string();
     git(repo.path(), ["switch", "main"]);
     git(
         repo.remote_path(),
@@ -693,16 +790,17 @@ fn cleanup_yes_deletes_unmerged_gone_branch_when_merged_pr_matches_default() {
         ],
     );
     let cache_home = tempfile::tempdir().expect("cache home");
-    let fake_bin = fake_gh(
+    let fake_bin = fake_gh(&format!(
         r#"
 if [ "$1" = "pr" ] && [ "$2" = "list" ]; then
-  printf '[{"number":9,"title":"Squash merged","headRefName":"feature/squash-merged","baseRefName":"main","state":"MERGED","isDraft":false,"mergedAt":"2026-05-12T12:00:00Z","updatedAt":"2026-05-12T12:00:00Z","url":"https://github.com/owner/repo/pull/9"}]'
+  printf '[{{"number":9,"title":"Squash merged","headRefName":"feature/squash-merged","headRefOid":"{}","headRepository":{{"nameWithOwner":"owner/repo"}},"baseRefName":"main","state":"MERGED","isDraft":false,"mergedAt":"2026-05-12T12:00:00Z","updatedAt":"2026-05-12T12:00:00Z","url":"https://github.com/owner/repo/pull/9"}}]'
   exit 0
 fi
 printf 'unexpected gh args: %s\n' "$*" >&2
 exit 1
 "#,
-    );
+        local_head
+    ));
 
     let output = Command::new(env!("CARGO_BIN_EXE_git-ws"))
         .current_dir(repo.path())
@@ -715,6 +813,122 @@ exit 1
     assert_success(&output);
     let branches = git(repo.path(), ["branch", "--list", "feature/squash-merged"]);
     assert_eq!(String::from_utf8_lossy(&branches.stdout).trim(), "");
+}
+
+#[test]
+fn cleanup_yes_keeps_gone_branch_when_merged_pr_head_does_not_match_local_branch() {
+    let repo = TestRepo::with_remote();
+    repo.create_remote_branch("feature/reused-pr-head");
+    let pr_head =
+        String::from_utf8_lossy(&git(repo.path(), ["rev-parse", "feature/reused-pr-head"]).stdout)
+            .trim()
+            .to_string();
+    git(repo.path(), ["switch", "feature/reused-pr-head"]);
+    fs::write(repo.path().join("local-only.txt"), "local\n").expect("write local change");
+    git(repo.path(), ["add", "local-only.txt"]);
+    git(repo.path(), ["commit", "-m", "local only"]);
+    git(repo.path(), ["switch", "main"]);
+    git(
+        repo.remote_path(),
+        ["branch", "-D", "feature/reused-pr-head"],
+    );
+    git(repo.path(), ["fetch", "--prune", "origin"]);
+    git(
+        repo.path(),
+        [
+            "remote",
+            "add",
+            "github",
+            "https://github.com/owner/repo.git",
+        ],
+    );
+    let cache_home = tempfile::tempdir().expect("cache home");
+    let fake_bin = fake_gh(&format!(
+        r#"
+if [ "$1" = "pr" ] && [ "$2" = "list" ]; then
+  printf '[{{"number":13,"title":"Reused branch","headRefName":"feature/reused-pr-head","headRefOid":"{}","headRepository":{{"nameWithOwner":"owner/repo"}},"baseRefName":"main","state":"MERGED","isDraft":false,"mergedAt":"2026-05-15T12:00:00Z","updatedAt":"2026-05-15T12:00:00Z","url":"https://github.com/owner/repo/pull/13"}}]'
+  exit 0
+fi
+printf 'unexpected gh args: %s\n' "$*" >&2
+exit 1
+"#,
+        pr_head
+    ));
+
+    let output = Command::new(env!("CARGO_BIN_EXE_git-ws"))
+        .current_dir(repo.path())
+        .env("PATH", prepend_path(fake_bin.path()))
+        .env("XDG_CACHE_HOME", cache_home.path())
+        .args(["cleanup", "--yes"])
+        .output()
+        .expect("run git-ws");
+
+    assert_success(&output);
+    let branches = git(repo.path(), ["branch", "--list", "feature/reused-pr-head"]);
+    assert!(
+        String::from_utf8_lossy(&branches.stdout).contains("feature/reused-pr-head"),
+        "branch should be preserved when the merged PR head is not the local branch head"
+    );
+}
+
+#[test]
+fn cleanup_yes_keeps_gone_branch_when_merged_pr_head_repository_does_not_match() {
+    let repo = TestRepo::with_remote();
+    repo.create_remote_branch("feature/fork-name-collision");
+    git(repo.path(), ["switch", "feature/fork-name-collision"]);
+    fs::write(repo.path().join("local-only.txt"), "local\n").expect("write local change");
+    git(repo.path(), ["add", "local-only.txt"]);
+    git(repo.path(), ["commit", "-m", "local only"]);
+    let local_head = String::from_utf8_lossy(
+        &git(repo.path(), ["rev-parse", "feature/fork-name-collision"]).stdout,
+    )
+    .trim()
+    .to_string();
+    git(repo.path(), ["switch", "main"]);
+    git(
+        repo.remote_path(),
+        ["branch", "-D", "feature/fork-name-collision"],
+    );
+    git(repo.path(), ["fetch", "--prune", "origin"]);
+    git(
+        repo.path(),
+        [
+            "remote",
+            "add",
+            "github",
+            "https://github.com/owner/repo.git",
+        ],
+    );
+    let cache_home = tempfile::tempdir().expect("cache home");
+    let fake_bin = fake_gh(&format!(
+        r#"
+if [ "$1" = "pr" ] && [ "$2" = "list" ]; then
+  printf '[{{"number":14,"title":"Fork collision","headRefName":"feature/fork-name-collision","headRefOid":"{}","headRepository":{{"nameWithOwner":"contributor/repo"}},"baseRefName":"main","state":"MERGED","isDraft":false,"mergedAt":"2026-05-16T12:00:00Z","updatedAt":"2026-05-16T12:00:00Z","url":"https://github.com/owner/repo/pull/14"}}]'
+  exit 0
+fi
+printf 'unexpected gh args: %s\n' "$*" >&2
+exit 1
+"#,
+        local_head
+    ));
+
+    let output = Command::new(env!("CARGO_BIN_EXE_git-ws"))
+        .current_dir(repo.path())
+        .env("PATH", prepend_path(fake_bin.path()))
+        .env("XDG_CACHE_HOME", cache_home.path())
+        .args(["cleanup", "--yes"])
+        .output()
+        .expect("run git-ws");
+
+    assert_success(&output);
+    let branches = git(
+        repo.path(),
+        ["branch", "--list", "feature/fork-name-collision"],
+    );
+    assert!(
+        String::from_utf8_lossy(&branches.stdout).contains("feature/fork-name-collision"),
+        "branch should be preserved when the merged PR head repository differs"
+    );
 }
 
 #[test]

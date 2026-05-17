@@ -337,9 +337,9 @@ fn load_candidate_pull_requests(
     candidates: &[Candidate],
     refresh: bool,
 ) -> Result<HashMap<String, BranchPullRequestInfo>> {
-    let branches: Vec<String> = candidates
+    let branches: Vec<&str> = candidates
         .iter()
-        .filter_map(|candidate| candidate.local_ref.clone())
+        .map(candidate_pull_request_branch)
         .collect();
     load_branch_pull_requests(&branches, refresh)
 }
@@ -467,10 +467,14 @@ fn candidate_pull_request<'a>(
     candidate: &Candidate,
     pull_requests: &'a HashMap<String, BranchPullRequestInfo>,
 ) -> Option<&'a BranchPullRequestInfo> {
+    pull_requests.get(candidate_pull_request_branch(candidate))
+}
+
+fn candidate_pull_request_branch(candidate: &Candidate) -> &str {
     candidate
         .local_ref
         .as_deref()
-        .and_then(|branch| pull_requests.get(branch))
+        .unwrap_or(candidate.name.as_str())
 }
 
 fn pull_request_label(pull_request: Option<&BranchPullRequestInfo>) -> String {

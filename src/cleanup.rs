@@ -17,7 +17,7 @@ use crate::git::{
     current_worktree_root, default_branch, git_output, git_output_bytes, git_status,
     list_worktrees, list_worktrees_with_prunable, local_branch_name, prune_worktrees,
 };
-use crate::github::load_branch_pull_requests;
+use crate::github::{current_git_remote_repository, load_branch_pull_requests};
 use crate::path_to_str;
 use crate::tui::{
     self, HIGHLIGHT_SYMBOL, NavCommand, Outcome, Tone, TuiTerminal, header_style, label_line,
@@ -177,12 +177,27 @@ pub fn discover_cleanup_candidates() -> Result<Vec<CleanupInput>> {
     let default_local = local_branch_name(&default);
     let protected = protected_branches_for_default(default_local);
 
-    let (merged, dirty_paths) = thread::scope(|scope| {
+    let pr_branches: Vec<&str> = local
+        .iter()
+        .filter(|branch| branch.upstream_gone && !protected.contains(&branch.name))
+        .map(|branch| branch.name.as_str())
+        .collect();
+
+    let (merged, dirty_paths, pull_requests, github_repository) = thread::scope(|scope| {
         let merged = scope.spawn(|| merged_branches(&default));
         let dirty = scope.spawn(|| check_worktrees_dirty(&worktrees));
+        let pull_requests =
+            scope.spawn(|| load_branch_pull_requests(&pr_branches, false).unwrap_or_default());
+        let github_repository = scope.spawn(current_git_remote_repository);
         (
             merged.join().expect("merged_branches thread"),
             dirty.join().expect("check_worktrees_dirty thread"),
+            pull_requests.join().expect("pull_requests thread"),
+            github_repository
+                .join()
+                .expect("current_git_remote_repository thread")
+                .ok()
+                .flatten(),
         )
     });
     let merged: HashSet<String> = merged?.into_iter().collect();
@@ -192,21 +207,27 @@ pub fn discover_cleanup_candidates() -> Result<Vec<CleanupInput>> {
         .filter_map(|worktree| worktree.branch.as_deref().map(|branch| (branch, worktree)))
         .collect();
 
-    let mut inputs: Vec<_> = local
+    let inputs: Vec<_> = local
         .into_iter()
-        .filter(|(branch, _upstream_gone)| !protected.contains(branch))
-        .map(|(branch, upstream_gone)| {
-            let branch_worktree = worktree_by_branch.get(branch.as_str()).copied();
+        .filter(|branch| !protected.contains(&branch.name))
+        .map(|branch| {
+            let branch_worktree = worktree_by_branch.get(branch.name.as_str()).copied();
             let worktree_path = branch_worktree.map(|worktree| worktree.path.clone());
             let is_current_worktree = worktree_path.as_ref() == Some(&current_root);
             let is_main_worktree = branch_worktree.is_some_and(|worktree| worktree.is_main);
             let is_dirty = worktree_path
                 .as_ref()
                 .is_some_and(|path| dirty_paths.get(path).copied().unwrap_or(false));
+            let merged_to_default = merged.contains(&branch.name)
+                || pull_requests.get(&branch.name).is_some_and(|pull_request| {
+                    github_repository.as_deref().is_some_and(|repository| {
+                        pull_request.is_merged_into_head(default_local, repository, &branch.head)
+                    })
+                });
             CleanupInput {
-                upstream_gone,
-                merged_to_default: merged.contains(&branch),
-                branch,
+                upstream_gone: branch.upstream_gone,
+                merged_to_default,
+                branch: branch.name,
                 worktree_path,
                 is_current_worktree,
                 is_main_worktree,
@@ -214,27 +235,7 @@ pub fn discover_cleanup_candidates() -> Result<Vec<CleanupInput>> {
             }
         })
         .collect();
-    mark_github_merged_candidates(&mut inputs, default_local);
     Ok(inputs)
-}
-
-fn mark_github_merged_candidates(inputs: &mut [CleanupInput], default_local: &str) {
-    let branches: Vec<String> = inputs
-        .iter()
-        .filter(|input| input.upstream_gone && !input.merged_to_default)
-        .map(|input| input.branch.clone())
-        .collect();
-    let Ok(pull_requests) = load_branch_pull_requests(&branches, false) else {
-        return;
-    };
-    for input in inputs {
-        if pull_requests
-            .get(&input.branch)
-            .is_some_and(|pull_request| pull_request.is_merged_into(default_local))
-        {
-            input.merged_to_default = true;
-        }
-    }
 }
 
 fn check_worktrees_dirty(worktrees: &[crate::git::Worktree]) -> HashMap<PathBuf, bool> {
@@ -260,17 +261,31 @@ fn check_worktrees_dirty(worktrees: &[crate::git::Worktree]) -> HashMap<PathBuf,
     })
 }
 
-fn local_branches_with_track() -> Result<Vec<(String, bool)>> {
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct LocalCleanupBranch {
+    name: String,
+    upstream_gone: bool,
+    head: String,
+}
+
+fn local_branches_with_track() -> Result<Vec<LocalCleanupBranch>> {
     Ok(git_output([
         "for-each-ref",
-        "--format=%(refname)%09%(upstream:track)",
+        "--format=%(refname)%09%(upstream:track)%09%(objectname)",
         "refs/heads",
     ])?
     .lines()
     .filter_map(|line| {
-        let (branch, track) = line.split_once('\t')?;
+        let mut parts = line.split('\t');
+        let branch = parts.next()?;
+        let track = parts.next()?;
+        let head = parts.next()?;
         let branch = branch.strip_prefix("refs/heads/")?;
-        Some((branch.to_string(), track.contains("[gone]")))
+        Some(LocalCleanupBranch {
+            name: branch.to_string(),
+            upstream_gone: track.contains("[gone]"),
+            head: head.to_string(),
+        })
     })
     .collect())
 }
