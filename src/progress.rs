@@ -1,6 +1,11 @@
 use std::fmt;
 use std::io::{self, IsTerminal};
+#[cfg(test)]
+use std::sync::Mutex;
 use std::time::{Duration, Instant};
+
+#[cfg(test)]
+static STEP_LABELS: Mutex<Vec<String>> = Mutex::new(Vec::new());
 
 #[derive(Debug, Clone, Copy)]
 pub struct Progress {
@@ -18,6 +23,17 @@ impl Progress {
         Self { enabled: false }
     }
 
+    #[cfg(test)]
+    pub(crate) fn enabled_for_test() -> Self {
+        STEP_LABELS.lock().expect("step labels lock").clear();
+        Self { enabled: true }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn take_step_labels_for_test() -> Vec<String> {
+        std::mem::take(&mut *STEP_LABELS.lock().expect("step labels lock"))
+    }
+
     pub fn is_enabled(self) -> bool {
         self.enabled
     }
@@ -31,6 +47,11 @@ impl Progress {
     pub fn step(self, label: impl Into<String>) -> ProgressStep {
         let label = label.into();
         if self.enabled {
+            #[cfg(test)]
+            STEP_LABELS
+                .lock()
+                .expect("step labels lock")
+                .push(label.clone());
             eprintln!("git-ws: {label}...");
         }
         ProgressStep {

@@ -301,26 +301,18 @@ fn check_worktrees_dirty_with_progress(
         .map(|worktree| worktree.path.clone())
         .collect();
     let total = paths.len();
-    if total > 0 {
-        progress.log(format!(
+    let step = (total > 0).then(|| {
+        progress.step(format!(
             "checking worktree dirtiness for {total} worktree(s)"
-        ));
-    }
-    thread::scope(|scope| {
+        ))
+    });
+    let dirty_paths = thread::scope(|scope| {
         let handles: Vec<_> = paths
             .iter()
-            .enumerate()
-            .map(|(index, path)| {
+            .map(|path| {
                 let path = path.clone();
                 scope.spawn(move || {
-                    let step = progress.step(format!(
-                        "checking worktree dirtiness {}/{} {}",
-                        index + 1,
-                        total,
-                        path.display()
-                    ));
                     let is_dirty = !worktree_clean(&path).unwrap_or(false);
-                    step.done();
                     (path, is_dirty)
                 })
             })
@@ -329,7 +321,11 @@ fn check_worktrees_dirty_with_progress(
             .into_iter()
             .map(|handle| handle.join().expect("worktree_clean thread"))
             .collect()
-    })
+    });
+    if let Some(step) = step {
+        step.done();
+    }
+    dirty_paths
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -946,6 +942,26 @@ mod tests {
         .expect("delete selected cleanup candidates");
 
         assert_eq!(deleted, ["branch-2", "branch-0"]);
+    }
+
+    #[test]
+    fn worktree_dirty_check_uses_one_aggregate_progress_step() {
+        let worktrees: Vec<_> = (0..3)
+            .map(|index| crate::git::Worktree {
+                path: PathBuf::from(format!("/missing/worktree-{index}")),
+                head: None,
+                branch: Some(format!("feature/{index}")),
+                is_main: false,
+            })
+            .collect();
+        let progress = Progress::enabled_for_test();
+
+        let _dirty = check_worktrees_dirty_with_progress(&worktrees, progress);
+
+        assert_eq!(
+            Progress::take_step_labels_for_test(),
+            ["checking worktree dirtiness for 3 worktree(s)"]
+        );
     }
 
     #[test]

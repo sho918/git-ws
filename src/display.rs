@@ -75,8 +75,15 @@ fn widest_non_empty(widths: &[usize]) -> Option<usize> {
 
 pub fn terminal_columns(default: usize) -> usize {
     crossterm::terminal::size()
-        .map(|(columns, _)| usize::from(columns))
+        .map(|(columns, _)| terminal_columns_from_size(columns, default))
         .unwrap_or(default)
+}
+
+fn terminal_columns_from_size(columns: u16, default: usize) -> usize {
+    match columns {
+        0 => default,
+        columns => usize::from(columns),
+    }
 }
 
 #[cfg(test)]
@@ -114,5 +121,10 @@ mod tests {
                 .zip([6, 10, 8, 6])
                 .all(|(width, min)| *width >= min)
         );
+    }
+
+    #[test]
+    fn terminal_columns_uses_default_when_reported_width_is_zero() {
+        assert_eq!(terminal_columns_from_size(0, 140), 140);
     }
 }
