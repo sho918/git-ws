@@ -63,7 +63,7 @@ git ws open --type remote
 Interactive and TTY table views show dense columns for the selected workflow:
 
 - `git ws` and `git ws list`: status, branch name, upstream, tracking state,
-  head, path, and action. `git ws list --prs` also shows PR status and URL.
+  head, and path. `git ws list --prs` also shows PR status and URL.
 - `git ws issue`: number, title, author, labels, updated date, and planned
   branch.
 - `git ws pr`: number, title, author, head, base, review state, and updated
@@ -75,7 +75,9 @@ TTY views use color as a secondary signal: worktrees and merged PRs are green,
 local branches and draft PRs are yellow, remote refs and open PRs are cyan,
 stale, closed, or blocked states are red, behind/diverged states are magenta,
 and ahead states are blue. Non-TTY output and JSON never include ANSI color
-codes.
+codes. Long values in TTY tables are truncated with `…` to keep columns aligned.
+Long-running TTY list and cleanup operations print progress to stderr so stdout
+remains usable for the table or JSON payload.
 
 `git ws list --json` keeps the existing fields and adds `tracking` and `action`.
 When `--prs` is set, list output includes PR status and URL. PR lookups are
