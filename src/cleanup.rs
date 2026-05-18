@@ -13,12 +13,12 @@ use ratatui::text::{Line, Span};
 use ratatui::widgets::{Cell, Paragraph, Row, Table, TableState};
 use serde::Serialize;
 
-use crate::display::{fit_column_widths, pad_truncate, terminal_columns};
+use crate::display::{ColumnWidth, fit_priority_column_widths, pad_truncate, terminal_columns};
 use crate::git::{
     current_worktree_root, default_branch, git_output, git_output_bytes, git_status,
     list_worktrees, list_worktrees_with_prunable, local_branch_name, prune_worktrees,
 };
-use crate::github::{current_git_remote_repository, load_branch_pull_requests};
+use crate::github::{current_git_remote_repository, load_branch_pull_requests_with_status};
 use crate::path_to_str;
 use crate::progress::Progress;
 use crate::tui::{
@@ -234,9 +234,16 @@ pub fn discover_cleanup_candidates_with_progress(progress: Progress) -> Result<V
                 "loading PRs for {} gone branch(es)",
                 pr_branches.len()
             ));
-            let values = load_branch_pull_requests(&pr_branches, false).unwrap_or_default();
-            step.done();
-            values
+            match load_branch_pull_requests_with_status(&pr_branches, false) {
+                Ok(lookup) => {
+                    step.done_with_note(lookup.cache_status.progress_note());
+                    lookup.pull_requests
+                }
+                Err(_) => {
+                    step.failed();
+                    HashMap::new()
+                }
+            }
         });
         let github_repository = scope.spawn(|| {
             progress
@@ -435,9 +442,15 @@ fn print_cleanup_candidates(inputs: &[&CleanupInput], force: bool) {
 }
 
 fn cleanup_table_widths() -> Vec<usize> {
-    fit_column_widths(
-        &[4, 34, 16, 18, 30, 34],
-        &[2, 12, 8, 8, 8, 8],
+    fit_priority_column_widths(
+        &[
+            ColumnWidth::new(4, 2, 0, 0),
+            ColumnWidth::new(34, 12, 1, 5),
+            ColumnWidth::new(16, 8, 0, 1),
+            ColumnWidth::new(18, 8, 0, 2),
+            ColumnWidth::new(30, 8, 1, 3),
+            ColumnWidth::new(34, 8, 1, 4),
+        ],
         terminal_columns(140),
     )
 }

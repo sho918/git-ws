@@ -101,6 +101,31 @@ impl BranchPullRequestInfo {
     }
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PullRequestCacheStatus {
+    Hit,
+    Miss,
+    Refresh,
+    NoGitHubRemote,
+}
+
+impl PullRequestCacheStatus {
+    pub fn progress_note(self) -> &'static str {
+        match self {
+            PullRequestCacheStatus::Hit => "cache hit",
+            PullRequestCacheStatus::Miss => "cache miss",
+            PullRequestCacheStatus::Refresh => "cache refresh",
+            PullRequestCacheStatus::NoGitHubRemote => "no GitHub remote",
+        }
+    }
+}
+
+#[derive(Debug, Clone)]
+pub struct BranchPullRequestLookup {
+    pub pull_requests: HashMap<String, BranchPullRequestInfo>,
+    pub cache_status: PullRequestCacheStatus,
+}
+
 #[derive(Debug, Clone, Deserialize, Serialize)]
 #[serde(rename_all = "camelCase")]
 struct RawBranchPullRequest {
@@ -237,32 +262,46 @@ pub fn list_open_prs() -> Result<Vec<PullRequestListItem>> {
     ])
 }
 
-pub fn load_branch_pull_requests(
+pub fn load_branch_pull_requests_with_status(
     branches: &[&str],
     refresh: bool,
-) -> Result<HashMap<String, BranchPullRequestInfo>> {
+) -> Result<BranchPullRequestLookup> {
     let branches = requested_branch_names(branches);
     if branches.is_empty() {
-        return Ok(HashMap::new());
+        return Ok(BranchPullRequestLookup {
+            pull_requests: HashMap::new(),
+            cache_status: PullRequestCacheStatus::Miss,
+        });
     }
     let Some(repository) = current_git_remote_repository()? else {
-        return Ok(HashMap::new());
+        return Ok(BranchPullRequestLookup {
+            pull_requests: HashMap::new(),
+            cache_status: PullRequestCacheStatus::NoGitHubRemote,
+        });
     };
-    let pull_requests =
-        if !refresh && let Some(cached) = read_fresh_pr_cache(&repository, &branches) {
-            cached?
+    let cached = if refresh {
+        None
+    } else {
+        read_fresh_pr_cache(&repository, &branches)
+    };
+    let (pull_requests, cache_status) = if let Some(cached) = cached {
+        (cached?, PullRequestCacheStatus::Hit)
+    } else {
+        let cache = fetch_branch_pull_requests(&repository, &branches)?;
+        let values = flatten_cached_pull_requests(&cache, &branches);
+        write_pr_cache(&repository, cache).ok();
+        let status = if refresh {
+            PullRequestCacheStatus::Refresh
         } else {
-            let cache = fetch_branch_pull_requests(&repository, &branches)?;
-            let values = flatten_cached_pull_requests(&cache, &branches);
-            write_pr_cache(&repository, cache).ok();
-            values
+            PullRequestCacheStatus::Miss
         };
+        (values, status)
+    };
 
-    Ok(pull_requests_by_branch(
-        &branches,
-        &repository,
-        pull_requests,
-    ))
+    Ok(BranchPullRequestLookup {
+        pull_requests: pull_requests_by_branch(&branches, &repository, pull_requests),
+        cache_status,
+    })
 }
 
 pub fn issue_picker_entries(issues: &[IssueListItem]) -> Vec<PickerEntry<String>> {

@@ -29,7 +29,7 @@ test commands, see [development.md](development.md).
    ```sh
    git add Cargo.toml Cargo.lock
    git commit -m "chore: release vX.Y.Z"
-   git tag vX.Y.Z
+   git tag -a vX.Y.Z -m "Release vX.Y.Z"
    git push origin HEAD --tags
    ```
 

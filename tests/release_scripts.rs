@@ -60,6 +60,11 @@ exit 1
         std::fs::read_to_string(cargo_log).expect("read cargo args"),
         "check\n"
     );
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(
+        stdout.contains(r#"git tag -a v1.2.3 -m "Release v1.2.3""#),
+        "stdout should include annotated release tag command:\n{stdout}"
+    );
 }
 
 #[test]

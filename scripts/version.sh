@@ -47,5 +47,5 @@ printf 'release tag: v%s\n' "$version"
 printf '\nnext steps:\n'
 printf '  git add Cargo.toml Cargo.lock\n'
 printf '  git commit -m "chore: release v%s"\n' "$version"
-printf '  git tag v%s\n' "$version"
+printf '  git tag -a v%s -m "Release v%s"\n' "$version" "$version"
 printf '  git push origin HEAD --tags\n'
