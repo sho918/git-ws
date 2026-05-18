@@ -9,14 +9,14 @@ use git_ws::candidates::{
     Candidate, CandidateFilter, TrackingState, load_candidates, load_candidates_with_progress,
 };
 use git_ws::cleanup::{CleanupOptions, run_cleanup};
-use git_ws::display::{fit_column_widths, pad_truncate, terminal_columns};
+use git_ws::display::{ColumnWidth, fit_priority_column_widths, pad_truncate, terminal_columns};
 use git_ws::git::{
     branch_exists, current_branch, default_branch, emit_cd_path, git_status, local_branch_name,
     remote_tracking_ref_for_branch, remote_tracking_refname,
 };
 use git_ws::github::{
     BranchPullRequestInfo, create_issue_worktree, create_pr_worktree, issue_picker_entries,
-    list_open_issues, list_open_prs, load_branch_pull_requests, pr_picker_entries,
+    list_open_issues, list_open_prs, load_branch_pull_requests_with_status, pr_picker_entries,
 };
 use git_ws::picker::{PickerView, pick_candidate, pick_entry};
 use git_ws::progress::Progress;
@@ -350,10 +350,17 @@ fn load_candidate_pull_requests(
     if branches.is_empty() {
         return Ok(HashMap::new());
     }
-    progress.run_result(
-        format!("loading PRs for {} branch(es)", branches.len()),
-        || load_branch_pull_requests(&branches, refresh),
-    )
+    let step = progress.step(format!("loading PRs for {} branch(es)", branches.len()));
+    match load_branch_pull_requests_with_status(&branches, refresh) {
+        Ok(lookup) => {
+            step.done_with_note(lookup.cache_status.progress_note());
+            Ok(lookup.pull_requests)
+        }
+        Err(error) => {
+            step.failed();
+            Err(error)
+        }
+    }
 }
 
 fn print_candidate_table(
@@ -396,15 +403,29 @@ fn print_candidate_table(
 fn list_table_widths(with_prs: bool) -> Vec<usize> {
     let terminal_width = terminal_columns(if with_prs { 180 } else { 140 });
     if with_prs {
-        fit_column_widths(
-            &[12, 38, 32, 16, 10, 32, 12, 40],
-            &[7, 12, 10, 8, 7, 8, 6, 8],
+        fit_priority_column_widths(
+            &[
+                ColumnWidth::fixed(9),
+                ColumnWidth::new(28, 12, 1, 1),
+                ColumnWidth::new(24, 10, 1, 2),
+                ColumnWidth::new(12, 8, 1, 3),
+                ColumnWidth::fixed(7),
+                ColumnWidth::new(28, 8, 3, 5),
+                ColumnWidth::fixed(12),
+                ColumnWidth::new(16, 8, 4, 6),
+            ],
             terminal_width,
         )
     } else {
-        fit_column_widths(
-            &[12, 38, 32, 16, 10, 40],
-            &[7, 12, 10, 8, 7, 8],
+        fit_priority_column_widths(
+            &[
+                ColumnWidth::fixed(9),
+                ColumnWidth::new(38, 12, 1, 1),
+                ColumnWidth::new(32, 10, 1, 2),
+                ColumnWidth::new(16, 8, 1, 3),
+                ColumnWidth::fixed(7),
+                ColumnWidth::new(40, 8, 4, 4),
+            ],
             terminal_width,
         )
     }
@@ -451,7 +472,7 @@ fn candidate_pr_row(
         color_tracking(candidate, widths[3]),
         pad_truncate(candidate.head_label(), widths[4]),
         color_path(candidate, widths[5]),
-        color_pull_request(pull_request, widths[6]),
+        linked_pull_request(pull_request, widths[6]),
         pad_truncate(pull_request_url(pull_request), widths[7]),
     ]
     .join(" ")
@@ -558,6 +579,26 @@ fn color_pull_request(pull_request: Option<&BranchPullRequestInfo>, width: usize
         _ => 2,
     };
     color_padded(&pull_request.label(), code, width)
+}
+
+fn linked_pull_request(pull_request: Option<&BranchPullRequestInfo>, width: usize) -> String {
+    let label = color_pull_request(pull_request, width);
+    let Some(pull_request) = pull_request else {
+        return label;
+    };
+    terminal_hyperlink(&pull_request.url, &label)
+}
+
+fn terminal_hyperlink(uri: &str, label: &str) -> String {
+    let uri = sanitize_hyperlink_uri(uri);
+    if uri.is_empty() {
+        return label.to_string();
+    }
+    format!("\x1b]8;;{uri}\x1b\\{label}\x1b]8;;\x1b\\")
+}
+
+fn sanitize_hyperlink_uri(uri: &str) -> String {
+    uri.chars().filter(|ch| !ch.is_control()).collect()
 }
 
 fn color_padded(value: &str, code: u8, width: usize) -> String {
@@ -855,7 +896,49 @@ mod tests {
 
         assert!(row.contains('…'), "{row}");
         assert!(!row.contains("super-long-branch-name-that-breaks"), "{row}");
-        assert!(!row.contains("1234567890"), "{row}");
+        assert!(row.contains("https://git…"), "{row}");
+    }
+
+    #[test]
+    fn candidate_pr_row_links_pr_label_to_url() {
+        let candidate = Candidate {
+            name: "feature/click-pr".to_string(),
+            worktree_path: None,
+            local_ref: Some("feature/click-pr".to_string()),
+            remote_ref: None,
+            upstream: Some("origin/feature/click-pr".to_string()),
+            worktree_head: None,
+            local_head: Some("abcdef0".to_string()),
+            remote_head: None,
+            tracking: TrackingInfo::no_upstream(),
+        };
+        let pull_request = BranchPullRequestInfo {
+            number: 419,
+            title: "Click PR".to_string(),
+            head_ref_name: candidate.name.clone(),
+            head_ref_oid: None,
+            head_repository: None,
+            base_ref_name: Some("main".to_string()),
+            state: "open".to_string(),
+            is_draft: false,
+            merged_at: None,
+            closed_at: None,
+            updated_at: Some("2026-05-18T00:00:00Z".to_string()),
+            url: "https://github.com/owner/repo/pull/419".to_string(),
+        };
+
+        let row = candidate_pr_row(
+            &candidate,
+            Some(&pull_request),
+            &[7, 16, 16, 10, 7, 8, 9, 12],
+        );
+
+        assert!(
+            row.contains("\x1b]8;;https://github.com/owner/repo/pull/419\x1b\\"),
+            "{row:?}"
+        );
+        assert!(row.contains("#419 open"), "{row:?}");
+        assert!(row.contains("\x1b]8;;\x1b\\"), "{row:?}");
     }
 
     #[test]
