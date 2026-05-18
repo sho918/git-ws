@@ -5,8 +5,11 @@ use std::io::{self, IsTerminal};
 use std::path::PathBuf;
 
 use anyhow::{Result, anyhow};
-use git_ws::candidates::{Candidate, CandidateFilter, TrackingState, load_candidates};
+use git_ws::candidates::{
+    Candidate, CandidateFilter, TrackingState, load_candidates, load_candidates_with_progress,
+};
 use git_ws::cleanup::{CleanupOptions, run_cleanup};
+use git_ws::display::{fit_column_widths, pad_truncate, terminal_columns};
 use git_ws::git::{
     branch_exists, current_branch, default_branch, emit_cd_path, git_status, local_branch_name,
     remote_tracking_ref_for_branch, remote_tracking_refname,
@@ -16,6 +19,7 @@ use git_ws::github::{
     list_open_issues, list_open_prs, load_branch_pull_requests, pr_picker_entries,
 };
 use git_ws::picker::{PickerView, pick_candidate, pick_entry};
+use git_ws::progress::Progress;
 use git_ws::shell::init_script;
 use git_ws::worktree::{CreateWorktreeOptions, create_worktree, find_worktree_for_branch};
 use lexopt::prelude::*;
@@ -140,9 +144,10 @@ fn cmd_list(args: Vec<OsString>) -> Result<()> {
         prs,
         refresh_prs,
     } = parse_list_args(args)?;
-    let candidates = load_candidates(filter)?;
+    let progress = Progress::stderr_for_terminal_output(!json && io::stdout().is_terminal());
+    let candidates = load_candidates_with_progress(filter, progress)?;
     let pull_requests = if prs {
-        match load_candidate_pull_requests(&candidates, refresh_prs) {
+        match load_candidate_pull_requests(&candidates, refresh_prs, progress) {
             Ok(values) => Some(values),
             Err(error) => {
                 eprintln!("git-ws: PR lookup failed: {error:#}");
@@ -336,12 +341,19 @@ fn cmd_doctor() -> Result<()> {
 fn load_candidate_pull_requests(
     candidates: &[Candidate],
     refresh: bool,
+    progress: Progress,
 ) -> Result<HashMap<String, BranchPullRequestInfo>> {
     let branches: Vec<&str> = candidates
         .iter()
         .map(candidate_pull_request_branch)
         .collect();
-    load_branch_pull_requests(&branches, refresh)
+    if branches.is_empty() {
+        return Ok(HashMap::new());
+    }
+    progress.run_result(
+        format!("loading PRs for {} branch(es)", branches.len()),
+        || load_branch_pull_requests(&branches, refresh),
+    )
 }
 
 fn print_candidate_table(
@@ -349,53 +361,100 @@ fn print_candidate_table(
     pull_requests: Option<&HashMap<String, BranchPullRequestInfo>>,
 ) {
     println!("git-ws worktrees");
-    if pull_requests.is_some() {
+    if let Some(pull_requests) = pull_requests {
+        let widths = list_table_widths(true);
         println!(
-            "{:<12} {:<34} {:<28} {:<16} {:<10} {:<28} {:<12} {:<36} Action",
-            "Status", "Name", "Upstream", "Track", "Head", "Path", "PR", "URL"
+            "{}",
+            plain_row(
+                &[
+                    "Status", "Name", "Upstream", "Track", "Head", "Path", "PR", "URL",
+                ],
+                &widths,
+            )
         );
-        println!(
-            "{:-<12} {:-<34} {:-<28} {:-<16} {:-<10} {:-<28} {:-<12} {:-<36} {:-<1}",
-            "", "", "", "", "", "", "", "", ""
-        );
-    } else {
-        println!(
-            "{:<12} {:<34} {:<28} {:<16} {:<10} {:<28} Action",
-            "Status", "Name", "Upstream", "Track", "Head", "Path"
-        );
-        println!(
-            "{:-<12} {:-<34} {:-<28} {:-<16} {:-<10} {:-<28} {:-<1}",
-            "", "", "", "", "", "", ""
-        );
-    }
-    for candidate in candidates {
-        if let Some(pull_requests) = pull_requests {
+        println!("{}", separator_row(&widths));
+        for candidate in candidates {
             let pull_request = candidate_pull_request(candidate, pull_requests);
-            println!(
-                "{} {:<34} {} {} {:<10} {} {} {:<36} {}",
-                color_candidate_status(candidate, 12),
-                candidate.name,
-                color_remote(candidate.upstream_label(), 28),
-                color_tracking(candidate, 16),
-                candidate.head_label(),
-                color_path(candidate, 28),
-                color_pull_request(pull_request, 12),
-                pull_request_url(pull_request),
-                color_info(&candidate.action_label())
-            );
-        } else {
-            println!(
-                "{} {:<34} {} {} {:<10} {} {}",
-                color_candidate_status(candidate, 12),
-                candidate.name,
-                color_remote(candidate.upstream_label(), 28),
-                color_tracking(candidate, 16),
-                candidate.head_label(),
-                color_path(candidate, 28),
-                color_info(&candidate.action_label())
-            );
+            println!("{}", candidate_pr_row(candidate, pull_request, &widths));
+        }
+    } else {
+        let widths = list_table_widths(false);
+        println!(
+            "{}",
+            plain_row(
+                &["Status", "Name", "Upstream", "Track", "Head", "Path"],
+                &widths
+            )
+        );
+        println!("{}", separator_row(&widths));
+        for candidate in candidates {
+            println!("{}", candidate_row(candidate, &widths));
         }
     }
+}
+
+fn list_table_widths(with_prs: bool) -> Vec<usize> {
+    let terminal_width = terminal_columns(if with_prs { 180 } else { 140 });
+    if with_prs {
+        fit_column_widths(
+            &[12, 38, 32, 16, 10, 32, 12, 40],
+            &[7, 12, 10, 8, 7, 8, 6, 8],
+            terminal_width,
+        )
+    } else {
+        fit_column_widths(
+            &[12, 38, 32, 16, 10, 40],
+            &[7, 12, 10, 8, 7, 8],
+            terminal_width,
+        )
+    }
+}
+
+fn plain_row(values: &[&str], widths: &[usize]) -> String {
+    values
+        .iter()
+        .zip(widths)
+        .map(|(value, width)| pad_truncate(value, *width))
+        .collect::<Vec<_>>()
+        .join(" ")
+}
+
+fn separator_row(widths: &[usize]) -> String {
+    widths
+        .iter()
+        .map(|width| "-".repeat(*width))
+        .collect::<Vec<_>>()
+        .join(" ")
+}
+
+fn candidate_row(candidate: &Candidate, widths: &[usize]) -> String {
+    [
+        color_candidate_status(candidate, widths[0]),
+        pad_truncate(&candidate.name, widths[1]),
+        color_remote(candidate.upstream_label(), widths[2]),
+        color_tracking(candidate, widths[3]),
+        pad_truncate(candidate.head_label(), widths[4]),
+        color_path(candidate, widths[5]),
+    ]
+    .join(" ")
+}
+
+fn candidate_pr_row(
+    candidate: &Candidate,
+    pull_request: Option<&BranchPullRequestInfo>,
+    widths: &[usize],
+) -> String {
+    [
+        color_candidate_status(candidate, widths[0]),
+        pad_truncate(&candidate.name, widths[1]),
+        color_remote(candidate.upstream_label(), widths[2]),
+        color_tracking(candidate, widths[3]),
+        pad_truncate(candidate.head_label(), widths[4]),
+        color_path(candidate, widths[5]),
+        color_pull_request(pull_request, widths[6]),
+        pad_truncate(pull_request_url(pull_request), widths[7]),
+    ]
+    .join(" ")
 }
 
 #[derive(Serialize)]
@@ -501,16 +560,8 @@ fn color_pull_request(pull_request: Option<&BranchPullRequestInfo>, width: usize
     color_padded(&pull_request.label(), code, width)
 }
 
-fn color_info(value: &str) -> String {
-    color(value, 36)
-}
-
-fn color(value: &str, code: u8) -> String {
-    format!("\x1b[{code}m{value}\x1b[0m")
-}
-
 fn color_padded(value: &str, code: u8, width: usize) -> String {
-    format!("\x1b[{code}m{value:<width$}\x1b[0m")
+    format!("\x1b[{code}m{}\x1b[0m", pad_truncate(value, width))
 }
 
 fn run_candidate(candidate: Candidate) -> Result<()> {
@@ -749,4 +800,80 @@ cleanup --json adds eligibility/action fields.
 Use `git ws open --type remote` to pick from remote branches only.
 "#
     );
+}
+
+#[cfg(test)]
+mod tests {
+    use std::path::PathBuf;
+
+    use git_ws::candidates::{Candidate, TrackingInfo};
+    use git_ws::github::BranchPullRequestInfo;
+
+    use super::*;
+
+    #[test]
+    fn candidate_pr_row_truncates_long_tty_values() {
+        let candidate = Candidate {
+            name: "feature/super-long-branch-name-that-breaks-fixed-width-output".to_string(),
+            worktree_path: Some(PathBuf::from(
+                "/repo/.worktrees/super-long-branch-name-that-breaks-fixed-width-output",
+            )),
+            local_ref: Some(
+                "feature/super-long-branch-name-that-breaks-fixed-width-output".to_string(),
+            ),
+            remote_ref: Some(
+                "origin/feature/super-long-branch-name-that-breaks-fixed-width-output".to_string(),
+            ),
+            upstream: Some(
+                "origin/feature/super-long-branch-name-that-breaks-fixed-width-output".to_string(),
+            ),
+            worktree_head: Some("abcdef0".to_string()),
+            local_head: Some("abcdef0".to_string()),
+            remote_head: Some("abcdef0".to_string()),
+            tracking: TrackingInfo::no_upstream(),
+        };
+        let pull_request = BranchPullRequestInfo {
+            number: 123,
+            title: "Long PR".to_string(),
+            head_ref_name: candidate.name.clone(),
+            head_ref_oid: None,
+            head_repository: None,
+            base_ref_name: Some("main".to_string()),
+            state: "merged".to_string(),
+            is_draft: false,
+            merged_at: Some("2026-05-17T00:00:00Z".to_string()),
+            closed_at: None,
+            updated_at: Some("2026-05-17T00:00:00Z".to_string()),
+            url: "https://github.com/owner/repo/pull/1234567890".to_string(),
+        };
+
+        let row = candidate_pr_row(
+            &candidate,
+            Some(&pull_request),
+            &[7, 12, 10, 8, 7, 8, 6, 12],
+        );
+
+        assert!(row.contains('…'), "{row}");
+        assert!(!row.contains("super-long-branch-name-that-breaks"), "{row}");
+        assert!(!row.contains("1234567890"), "{row}");
+    }
+
+    #[test]
+    fn candidate_rows_omit_action_column() {
+        let candidate = Candidate {
+            name: "feature/remove-action".to_string(),
+            worktree_path: None,
+            local_ref: Some("feature/remove-action".to_string()),
+            remote_ref: None,
+            upstream: None,
+            worktree_head: None,
+            local_head: Some("abcdef0".to_string()),
+            remote_head: None,
+            tracking: TrackingInfo::no_upstream(),
+        };
+
+        let row = candidate_row(&candidate, &[7, 20, 10, 10, 7, 8]);
+
+        assert!(!row.contains("git switch"), "{row}");
+    }
 }

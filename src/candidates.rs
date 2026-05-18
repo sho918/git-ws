@@ -7,6 +7,7 @@ use serde::Serialize;
 use crate::git::{
     LocalBranch, Worktree, list_local_branches, list_remote_branches, list_worktrees,
 };
+use crate::progress::Progress;
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct Candidate {
@@ -207,10 +208,19 @@ impl TrackingInfo {
 }
 
 pub fn load_candidates(filter: CandidateFilter) -> Result<Vec<Candidate>> {
+    load_candidates_with_progress(filter, Progress::disabled())
+}
+
+pub fn load_candidates_with_progress(
+    filter: CandidateFilter,
+    progress: Progress,
+) -> Result<Vec<Candidate>> {
     let (worktrees, local, remote) = std::thread::scope(|scope| -> Result<_> {
-        let worktrees = scope.spawn(list_worktrees);
-        let local = scope.spawn(list_local_branches);
-        let remote = scope.spawn(list_remote_branches);
+        let worktrees = scope.spawn(|| progress.run_result("loading worktrees", list_worktrees));
+        let local =
+            scope.spawn(|| progress.run_result("loading local branches", list_local_branches));
+        let remote =
+            scope.spawn(|| progress.run_result("loading remote branches", list_remote_branches));
         Ok((
             worktrees.join().expect("list_worktrees thread")?,
             local.join().expect("list_local_branches thread")?,

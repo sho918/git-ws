@@ -13,12 +13,14 @@ use ratatui::text::{Line, Span};
 use ratatui::widgets::{Cell, Paragraph, Row, Table, TableState};
 use serde::Serialize;
 
+use crate::display::{fit_column_widths, pad_truncate, terminal_columns};
 use crate::git::{
     current_worktree_root, default_branch, git_output, git_output_bytes, git_status,
     list_worktrees, list_worktrees_with_prunable, local_branch_name, prune_worktrees,
 };
 use crate::github::{current_git_remote_repository, load_branch_pull_requests};
 use crate::path_to_str;
+use crate::progress::Progress;
 use crate::tui::{
     self, HIGHLIGHT_SYMBOL, NavCommand, Outcome, Tone, TuiTerminal, header_style, label_line,
     panel, row_highlight_style, tone_style,
@@ -82,7 +84,9 @@ pub struct CleanupOptions {
 }
 
 pub fn run_cleanup(options: CleanupOptions) -> Result<()> {
-    let candidates = discover_cleanup_candidates()?;
+    let progress =
+        Progress::stderr_for_terminal_output(!options.json && io::stdout().is_terminal());
+    let candidates = discover_cleanup_candidates_with_progress(progress)?;
 
     if options.json {
         print_cleanup_json(&candidates, options.force)?;
@@ -111,20 +115,43 @@ pub fn run_cleanup(options: CleanupOptions) -> Result<()> {
         prompt_cleanup_selection(&safe, options.force)?
     };
 
-    delete_cleanup_candidates_with(&safe, &selected, options.force, delete_cleanup_candidate)
+    delete_cleanup_candidates_with_progress(
+        &safe,
+        &selected,
+        options.force,
+        progress,
+        delete_cleanup_candidate,
+    )
 }
 
+#[cfg(test)]
 fn delete_cleanup_candidates_with<F>(
     safe: &[&CleanupInput],
     selected: &[usize],
     force: bool,
+    delete: F,
+) -> Result<()>
+where
+    F: FnMut(&CleanupInput, bool) -> Result<()>,
+{
+    delete_cleanup_candidates_with_progress(safe, selected, force, Progress::disabled(), delete)
+}
+
+fn delete_cleanup_candidates_with_progress<F>(
+    safe: &[&CleanupInput],
+    selected: &[usize],
+    force: bool,
+    progress: Progress,
     mut delete: F,
 ) -> Result<()>
 where
     F: FnMut(&CleanupInput, bool) -> Result<()>,
 {
     for &index in selected {
-        delete(safe[index], force)?;
+        let input = safe[index];
+        progress.run_result(format!("deleting {}", input.branch), || {
+            delete(input, force)
+        })?;
     }
     Ok(())
 }
@@ -147,11 +174,23 @@ fn is_stale_or_merged(input: &CleanupInput) -> bool {
 }
 
 pub fn discover_cleanup_candidates() -> Result<Vec<CleanupInput>> {
+    discover_cleanup_candidates_with_progress(Progress::disabled())
+}
+
+pub fn discover_cleanup_candidates_with_progress(progress: Progress) -> Result<Vec<CleanupInput>> {
     let (current_root, worktrees_pair, local, default) = thread::scope(|scope| -> Result<_> {
-        let current_root = scope.spawn(current_worktree_root);
-        let worktrees = scope.spawn(list_worktrees_with_prunable);
-        let local = scope.spawn(local_branches_with_track);
-        let default = scope.spawn(default_branch);
+        let current_root = scope
+            .spawn(|| progress.run_result("resolving current worktree", current_worktree_root));
+        let worktrees =
+            scope.spawn(|| progress.run_result("loading worktrees", list_worktrees_with_prunable));
+        let local = scope
+            .spawn(|| progress.run_result("loading local branches", local_branches_with_track));
+        let default = scope.spawn(|| {
+            let step = progress.step("resolving default branch");
+            let value = default_branch();
+            step.done();
+            value
+        });
         Ok((
             current_root.join().expect("current_worktree_root thread")?,
             worktrees.join().expect("list_worktrees thread")?,
@@ -161,8 +200,8 @@ pub fn discover_cleanup_candidates() -> Result<Vec<CleanupInput>> {
     })?;
     let (worktrees_initial, prunable_seen) = worktrees_pair;
     let worktrees = if prunable_seen {
-        prune_worktrees()?;
-        list_worktrees()?
+        progress.run_result("pruning stale worktrees", prune_worktrees)?;
+        progress.run_result("reloading worktrees", list_worktrees)?
     } else {
         worktrees_initial
     };
@@ -184,20 +223,34 @@ pub fn discover_cleanup_candidates() -> Result<Vec<CleanupInput>> {
         .collect();
 
     let (merged, dirty_paths, pull_requests, github_repository) = thread::scope(|scope| {
-        let merged = scope.spawn(|| merged_branches(&default));
-        let dirty = scope.spawn(|| check_worktrees_dirty(&worktrees));
-        let pull_requests =
-            scope.spawn(|| load_branch_pull_requests(&pr_branches, false).unwrap_or_default());
-        let github_repository = scope.spawn(current_git_remote_repository);
+        let merged = scope.spawn(|| {
+            progress.run_result("loading default-merged branches", || {
+                merged_branches(&default)
+            })
+        });
+        let dirty = scope.spawn(|| check_worktrees_dirty_with_progress(&worktrees, progress));
+        let pull_requests = scope.spawn(|| {
+            let step = progress.step(format!(
+                "loading PRs for {} gone branch(es)",
+                pr_branches.len()
+            ));
+            let values = load_branch_pull_requests(&pr_branches, false).unwrap_or_default();
+            step.done();
+            values
+        });
+        let github_repository = scope.spawn(|| {
+            progress
+                .run_result("resolving GitHub repository", current_git_remote_repository)
+                .ok()
+                .flatten()
+        });
         (
             merged.join().expect("merged_branches thread"),
             dirty.join().expect("check_worktrees_dirty thread"),
             pull_requests.join().expect("pull_requests thread"),
             github_repository
                 .join()
-                .expect("current_git_remote_repository thread")
-                .ok()
-                .flatten(),
+                .expect("current_git_remote_repository thread"),
         )
     });
     let merged: HashSet<String> = merged?.into_iter().collect();
@@ -235,15 +288,25 @@ pub fn discover_cleanup_candidates() -> Result<Vec<CleanupInput>> {
             }
         })
         .collect();
+    progress.log(format!("discovered {} cleanup candidate(s)", inputs.len()));
     Ok(inputs)
 }
 
-fn check_worktrees_dirty(worktrees: &[crate::git::Worktree]) -> HashMap<PathBuf, bool> {
+fn check_worktrees_dirty_with_progress(
+    worktrees: &[crate::git::Worktree],
+    progress: Progress,
+) -> HashMap<PathBuf, bool> {
     let paths: Vec<PathBuf> = worktrees
         .iter()
         .map(|worktree| worktree.path.clone())
         .collect();
-    thread::scope(|scope| {
+    let total = paths.len();
+    let step = (total > 0).then(|| {
+        progress.step(format!(
+            "checking worktree dirtiness for {total} worktree(s)"
+        ))
+    });
+    let dirty_paths = thread::scope(|scope| {
         let handles: Vec<_> = paths
             .iter()
             .map(|path| {
@@ -258,7 +321,11 @@ fn check_worktrees_dirty(worktrees: &[crate::git::Worktree]) -> HashMap<PathBuf,
             .into_iter()
             .map(|handle| handle.join().expect("worktree_clean thread"))
             .collect()
-    })
+    });
+    if let Some(step) = step {
+        step.done();
+    }
+    dirty_paths
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -329,26 +396,27 @@ fn worktree_clean(path: &Path) -> Result<bool> {
 
 fn print_cleanup_candidates(inputs: &[&CleanupInput], force: bool) {
     if io::stdout().is_terminal() {
+        let widths = cleanup_table_widths();
         println!("git-ws cleanup candidates");
         println!(
-            "{:<4} {:<34} {:<16} {:<18} {:<28} Action",
-            "No", "Branch", "Disposition", "Reasons", "Path"
+            "{}",
+            cleanup_plain_row(
+                &["No", "Branch", "Disposition", "Reasons", "Path", "Action"],
+                &widths,
+            )
         );
-        println!(
-            "{:-<4} {:-<34} {:-<16} {:-<18} {:-<28} {:-<1}",
-            "", "", "", "", "", ""
-        );
+        println!("{}", cleanup_separator_row(&widths));
         for (index, input) in inputs.iter().enumerate() {
             let disposition = classify_cleanup_candidate(input);
             let tone = tone_for(disposition, requires_force_for(disposition, input));
             println!(
-                "{:<4} {:<34} {} {:<18} {:<28} {}",
-                index + 1,
-                input.branch,
-                color_disposition(disposition, tone, 16),
-                cleanup_reason(input),
-                cleanup_path(input),
-                cleanup_action(input, force)
+                "{} {} {} {} {} {}",
+                pad_truncate(&(index + 1).to_string(), widths[0]),
+                pad_truncate(&input.branch, widths[1]),
+                color_disposition(disposition, tone, widths[2]),
+                pad_truncate(&cleanup_reason(input), widths[3]),
+                pad_truncate(&cleanup_path(input), widths[4]),
+                pad_truncate(&cleanup_action(input, force), widths[5])
             );
         }
     } else {
@@ -364,6 +432,31 @@ fn print_cleanup_candidates(inputs: &[&CleanupInput], force: bool) {
             );
         }
     }
+}
+
+fn cleanup_table_widths() -> Vec<usize> {
+    fit_column_widths(
+        &[4, 34, 16, 18, 30, 34],
+        &[2, 12, 8, 8, 8, 8],
+        terminal_columns(140),
+    )
+}
+
+fn cleanup_plain_row(values: &[&str], widths: &[usize]) -> String {
+    values
+        .iter()
+        .zip(widths)
+        .map(|(value, width)| pad_truncate(value, *width))
+        .collect::<Vec<_>>()
+        .join(" ")
+}
+
+fn cleanup_separator_row(widths: &[usize]) -> String {
+    widths
+        .iter()
+        .map(|width| "-".repeat(*width))
+        .collect::<Vec<_>>()
+        .join(" ")
 }
 
 fn cleanup_reason(input: &CleanupInput) -> String {
@@ -787,7 +880,10 @@ fn color_disposition(disposition: CleanupDisposition, tone: Tone, width: usize) 
         Tone::Bad => 31,
         _ => 2,
     };
-    format!("\x1b[{code}m{:<width$}\x1b[0m", disposition.as_str())
+    format!(
+        "\x1b[{code}m{}\x1b[0m",
+        pad_truncate(disposition.as_str(), width)
+    )
 }
 
 #[cfg(test)]
@@ -846,6 +942,26 @@ mod tests {
         .expect("delete selected cleanup candidates");
 
         assert_eq!(deleted, ["branch-2", "branch-0"]);
+    }
+
+    #[test]
+    fn worktree_dirty_check_uses_one_aggregate_progress_step() {
+        let worktrees: Vec<_> = (0..3)
+            .map(|index| crate::git::Worktree {
+                path: PathBuf::from(format!("/missing/worktree-{index}")),
+                head: None,
+                branch: Some(format!("feature/{index}")),
+                is_main: false,
+            })
+            .collect();
+        let progress = Progress::enabled_for_test();
+
+        let _dirty = check_worktrees_dirty_with_progress(&worktrees, progress);
+
+        assert_eq!(
+            Progress::take_step_labels_for_test(),
+            ["checking worktree dirtiness for 3 worktree(s)"]
+        );
     }
 
     #[test]
