@@ -7,7 +7,9 @@ use std::os::unix::fs::PermissionsExt;
 use git_ws::candidates::{
     Candidate, CandidateFilter, TrackingInfo, TrackingState, merge_candidates,
 };
-use git_ws::cleanup::{CleanupDisposition, CleanupInput, classify_cleanup_candidate};
+use git_ws::cleanup::{
+    CleanupDisposition, CleanupInput, DefaultBranchRelation, classify_cleanup_candidate,
+};
 use git_ws::config::{FileConfig, GitConfig, load_file_config, resolve_base_dir};
 use git_ws::git::{LocalBranch, Worktree, parse_worktree_porcelain};
 use git_ws::github::{
@@ -605,7 +607,7 @@ fn cleanup_keeps_only_safe_default_candidates() {
             is_main_worktree: false,
             is_dirty: false,
             upstream_gone: true,
-            merged_to_default: false,
+            default_relation: DefaultBranchRelation::Unmerged,
         }),
         CleanupDisposition::SkipUnmerged
     );
@@ -618,7 +620,20 @@ fn cleanup_keeps_only_safe_default_candidates() {
             is_main_worktree: false,
             is_dirty: false,
             upstream_gone: false,
-            merged_to_default: true,
+            default_relation: DefaultBranchRelation::Merged,
+        }),
+        CleanupDisposition::SafeDelete
+    );
+
+    assert_eq!(
+        classify_cleanup_candidate(&CleanupInput {
+            branch: "feature/unchanged".to_string(),
+            worktree_path: None,
+            is_current_worktree: false,
+            is_main_worktree: false,
+            is_dirty: false,
+            upstream_gone: false,
+            default_relation: DefaultBranchRelation::Unchanged,
         }),
         CleanupDisposition::SafeDelete
     );
@@ -631,7 +646,7 @@ fn cleanup_keeps_only_safe_default_candidates() {
             is_main_worktree: false,
             is_dirty: true,
             upstream_gone: true,
-            merged_to_default: true,
+            default_relation: DefaultBranchRelation::Merged,
         }),
         CleanupDisposition::SkipDirty
     );
@@ -647,7 +662,7 @@ fn cleanup_classification_protects_current_before_dirty() {
             is_main_worktree: true,
             is_dirty: true,
             upstream_gone: true,
-            merged_to_default: true,
+            default_relation: DefaultBranchRelation::Merged,
         }),
         CleanupDisposition::SkipCurrent
     );
@@ -663,7 +678,7 @@ fn cleanup_classification_protects_main_worktree() {
             is_main_worktree: true,
             is_dirty: false,
             upstream_gone: false,
-            merged_to_default: true,
+            default_relation: DefaultBranchRelation::Merged,
         }),
         CleanupDisposition::SkipMain
     );
@@ -679,7 +694,7 @@ fn cleanup_classification_skips_unmerged_branches() {
             is_main_worktree: false,
             is_dirty: false,
             upstream_gone: false,
-            merged_to_default: false,
+            default_relation: DefaultBranchRelation::Unmerged,
         }),
         CleanupDisposition::SkipUnmerged
     );
