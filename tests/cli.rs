@@ -6,6 +6,7 @@ use std::path::Path;
 use std::process::Command;
 
 use serde::Serialize;
+use serde_json::{Value, json};
 use support::{TestRepo, assert_success, command_output, git, last_stdout_line};
 
 #[test]
@@ -1374,6 +1375,71 @@ fn cleanup_json_reports_unmerged_gone_branch_as_skipped() {
 }
 
 #[test]
+fn cleanup_json_reports_fresh_branch_as_unchanged() {
+    let repo = TestRepo::with_remote();
+    git(repo.path(), ["switch", "-c", "feature/fresh"]);
+
+    let output = command_output(repo.path(), ["cleanup", "--json"]);
+
+    assert_success(&output);
+    let record = cleanup_json_record(&output.stdout, "feature/fresh");
+    assert_eq!(record["defaultRelation"], "unchanged");
+    assert_eq!(record["mergedToDefault"], false);
+    assert_eq!(record["reasons"], json!(["unchanged"]));
+}
+
+#[test]
+fn cleanup_json_reports_branch_without_own_commits_as_unchanged_after_default_advances() {
+    let repo = TestRepo::with_remote();
+    git(repo.path(), ["switch", "-c", "feature/no-own-commits"]);
+    git(repo.path(), ["switch", "main"]);
+    std::fs::write(repo.path().join("main-only.txt"), "main\n").expect("write main file");
+    git(repo.path(), ["add", "main-only.txt"]);
+    git(repo.path(), ["commit", "-m", "main advances"]);
+    git(repo.path(), ["push", "origin", "main"]);
+
+    let output = command_output(repo.path(), ["cleanup", "--json"]);
+
+    assert_success(&output);
+    let record = cleanup_json_record(&output.stdout, "feature/no-own-commits");
+    assert_eq!(record["defaultRelation"], "unchanged");
+    assert_eq!(record["mergedToDefault"], false);
+    assert_eq!(record["reasons"], json!(["unchanged"]));
+    assert_eq!(record["disposition"], "SafeDelete");
+    assert_eq!(record["eligible"], true);
+    assert_eq!(record["action"], "git branch -D feature/no-own-commits");
+}
+
+#[test]
+fn cleanup_json_reports_branch_with_own_commits_merged_to_default_as_merged() {
+    let repo = TestRepo::with_remote();
+    git(repo.path(), ["switch", "-c", "feature/merged-json"]);
+    std::fs::write(repo.path().join("merged-json.txt"), "merged\n").expect("write branch file");
+    git(repo.path(), ["add", "merged-json.txt"]);
+    git(repo.path(), ["commit", "-m", "merged json"]);
+    git(repo.path(), ["switch", "main"]);
+    git(
+        repo.path(),
+        [
+            "merge",
+            "--no-ff",
+            "feature/merged-json",
+            "-m",
+            "merge json branch",
+        ],
+    );
+    git(repo.path(), ["push", "origin", "main"]);
+
+    let output = command_output(repo.path(), ["cleanup", "--json"]);
+
+    assert_success(&output);
+    let record = cleanup_json_record(&output.stdout, "feature/merged-json");
+    assert_eq!(record["defaultRelation"], "merged");
+    assert_eq!(record["mergedToDefault"], true);
+    assert_eq!(record["reasons"], json!(["merged"]));
+}
+
+#[test]
 fn cleanup_yes_keeps_gone_default_branch() {
     let repo = TestRepo::with_remote();
     repo.create_remote_branch("feature/current");
@@ -1987,6 +2053,14 @@ fn cleanup_force_yes_skips_current_worktree() {
         "",
         "feature/force-clean should have been deleted"
     );
+}
+
+fn cleanup_json_record(stdout: &[u8], branch: &str) -> Value {
+    let records: Vec<Value> = serde_json::from_slice(stdout).expect("parse cleanup JSON");
+    records
+        .into_iter()
+        .find(|record| record.get("branch").and_then(Value::as_str) == Some(branch))
+        .unwrap_or_else(|| panic!("missing cleanup record for {branch}"))
 }
 
 fn write_trusted_init_store(repo_path: &Path, config_home: &Path, init_commands: &[String]) {

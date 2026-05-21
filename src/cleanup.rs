@@ -34,7 +34,36 @@ pub struct CleanupInput {
     pub is_main_worktree: bool,
     pub is_dirty: bool,
     pub upstream_gone: bool,
-    pub merged_to_default: bool,
+    pub default_relation: DefaultBranchRelation,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum DefaultBranchRelation {
+    Merged,
+    Unchanged,
+    Unmerged,
+}
+
+impl DefaultBranchRelation {
+    fn is_safe_to_delete(self) -> bool {
+        matches!(
+            self,
+            DefaultBranchRelation::Merged | DefaultBranchRelation::Unchanged
+        )
+    }
+
+    fn is_merged(self) -> bool {
+        self == DefaultBranchRelation::Merged
+    }
+
+    fn reason(self) -> &'static str {
+        match self {
+            DefaultBranchRelation::Merged => "merged",
+            DefaultBranchRelation::Unchanged => "unchanged",
+            DefaultBranchRelation::Unmerged => "unmerged",
+        }
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
@@ -68,7 +97,7 @@ pub fn classify_cleanup_candidate(input: &CleanupInput) -> CleanupDisposition {
     if input.is_dirty {
         return CleanupDisposition::SkipDirty;
     }
-    if input.merged_to_default {
+    if input.default_relation.is_safe_to_delete() {
         CleanupDisposition::SafeDelete
     } else {
         CleanupDisposition::SkipUnmerged
@@ -164,13 +193,13 @@ fn eligible_for(disposition: CleanupDisposition, input: &CleanupInput, force: bo
     match disposition {
         CleanupDisposition::SafeDelete => true,
         CleanupDisposition::SkipCurrent | CleanupDisposition::SkipMain => false,
-        CleanupDisposition::SkipDirty => force && is_stale_or_merged(input),
+        CleanupDisposition::SkipDirty => force && is_stale_or_safe(input),
         CleanupDisposition::SkipUnmerged => force && input.upstream_gone,
     }
 }
 
-fn is_stale_or_merged(input: &CleanupInput) -> bool {
-    input.upstream_gone || input.merged_to_default
+fn is_stale_or_safe(input: &CleanupInput) -> bool {
+    input.upstream_gone || input.default_relation.is_safe_to_delete()
 }
 
 pub fn discover_cleanup_candidates() -> Result<Vec<CleanupInput>> {
@@ -214,6 +243,9 @@ pub fn discover_cleanup_candidates_with_progress(progress: Progress) -> Result<V
         anyhow!("default branch could not be determined; set remote HEAD or use main/master")
     })?;
     let default_local = local_branch_name(&default);
+    let default_head = git_output(["rev-parse", "--verify", default.as_str()])?
+        .trim()
+        .to_string();
     let protected = protected_branches_for_default(default_local);
 
     let pr_branches: Vec<&str> = local
@@ -222,45 +254,51 @@ pub fn discover_cleanup_candidates_with_progress(progress: Progress) -> Result<V
         .map(|branch| branch.name.as_str())
         .collect();
 
-    let (merged, dirty_paths, pull_requests, github_repository) = thread::scope(|scope| {
-        let merged = scope.spawn(|| {
-            progress.run_result("loading default-merged branches", || {
-                merged_branches(&default)
-            })
-        });
-        let dirty = scope.spawn(|| check_worktrees_dirty_with_progress(&worktrees, progress));
-        let pull_requests = scope.spawn(|| {
-            let step = progress.step(format!(
-                "loading PRs for {} gone branch(es)",
-                pr_branches.len()
-            ));
-            match load_branch_pull_requests_with_status(&pr_branches, false) {
-                Ok(lookup) => {
-                    step.done_with_note(lookup.cache_status.progress_note());
-                    lookup.pull_requests
+    let (merged, creation_heads, dirty_paths, pull_requests, github_repository) =
+        thread::scope(|scope| {
+            let merged = scope.spawn(|| {
+                progress.run_result("loading default-merged branches", || {
+                    merged_branches(&default)
+                })
+            });
+            let creation_heads = scope.spawn(|| {
+                progress.run_result("loading branch creation heads", branch_creation_heads)
+            });
+            let dirty = scope.spawn(|| check_worktrees_dirty_with_progress(&worktrees, progress));
+            let pull_requests = scope.spawn(|| {
+                let step = progress.step(format!(
+                    "loading PRs for {} gone branch(es)",
+                    pr_branches.len()
+                ));
+                match load_branch_pull_requests_with_status(&pr_branches, false) {
+                    Ok(lookup) => {
+                        step.done_with_note(lookup.cache_status.progress_note());
+                        lookup.pull_requests
+                    }
+                    Err(_) => {
+                        step.failed();
+                        HashMap::new()
+                    }
                 }
-                Err(_) => {
-                    step.failed();
-                    HashMap::new()
-                }
-            }
+            });
+            let github_repository = scope.spawn(|| {
+                progress
+                    .run_result("resolving GitHub repository", current_git_remote_repository)
+                    .ok()
+                    .flatten()
+            });
+            (
+                merged.join().expect("merged_branches thread"),
+                creation_heads.join().expect("branch_creation_heads thread"),
+                dirty.join().expect("check_worktrees_dirty thread"),
+                pull_requests.join().expect("pull_requests thread"),
+                github_repository
+                    .join()
+                    .expect("current_git_remote_repository thread"),
+            )
         });
-        let github_repository = scope.spawn(|| {
-            progress
-                .run_result("resolving GitHub repository", current_git_remote_repository)
-                .ok()
-                .flatten()
-        });
-        (
-            merged.join().expect("merged_branches thread"),
-            dirty.join().expect("check_worktrees_dirty thread"),
-            pull_requests.join().expect("pull_requests thread"),
-            github_repository
-                .join()
-                .expect("current_git_remote_repository thread"),
-        )
-    });
     let merged: HashSet<String> = merged?.into_iter().collect();
+    let creation_heads = creation_heads?;
 
     let worktree_by_branch: HashMap<&str, &crate::git::Worktree> = worktrees
         .iter()
@@ -278,15 +316,18 @@ pub fn discover_cleanup_candidates_with_progress(progress: Progress) -> Result<V
             let is_dirty = worktree_path
                 .as_ref()
                 .is_some_and(|path| dirty_paths.get(path).copied().unwrap_or(false));
-            let merged_to_default = merged.contains(&branch.name)
-                || pull_requests.get(&branch.name).is_some_and(|pull_request| {
-                    github_repository.as_deref().is_some_and(|repository| {
-                        pull_request.is_merged_into_head(default_local, repository, &branch.head)
-                    })
-                });
+            let default_relation = if pull_requests.get(&branch.name).is_some_and(|pull_request| {
+                github_repository.as_deref().is_some_and(|repository| {
+                    pull_request.is_merged_into_head(default_local, repository, &branch.head)
+                })
+            }) {
+                DefaultBranchRelation::Merged
+            } else {
+                default_branch_relation(&branch, &merged, &creation_heads, &default_head)
+            };
             CleanupInput {
                 upstream_gone: branch.upstream_gone,
-                merged_to_default,
+                default_relation,
                 branch: branch.name,
                 worktree_path,
                 is_current_worktree,
@@ -380,6 +421,58 @@ fn merged_branches(default: &str) -> Result<Vec<String>> {
         .filter_map(|line| line.strip_prefix("refs/heads/").map(str::to_string))
         .filter(|branch| !branch.is_empty())
         .collect())
+}
+
+fn default_branch_relation(
+    branch: &LocalCleanupBranch,
+    merged: &HashSet<String>,
+    creation_heads: &HashMap<String, String>,
+    default_head: &str,
+) -> DefaultBranchRelation {
+    if !merged.contains(&branch.name) {
+        return DefaultBranchRelation::Unmerged;
+    }
+
+    if branch_is_unchanged_since_creation(branch, creation_heads, default_head) {
+        DefaultBranchRelation::Unchanged
+    } else {
+        DefaultBranchRelation::Merged
+    }
+}
+
+fn branch_is_unchanged_since_creation(
+    branch: &LocalCleanupBranch,
+    creation_heads: &HashMap<String, String>,
+    default_head: &str,
+) -> bool {
+    creation_heads
+        .get(&branch.name)
+        .map_or_else(|| branch.head == default_head, |head| *head == branch.head)
+}
+
+fn branch_creation_heads() -> Result<HashMap<String, String>> {
+    let output = match git_output(["reflog", "show", "--all", "--format=%H%x09%gD%x09%gs"]) {
+        Ok(output) => output,
+        Err(_) => return Ok(HashMap::new()),
+    };
+    Ok(parse_branch_creation_heads(&output))
+}
+
+fn parse_branch_creation_heads(output: &str) -> HashMap<String, String> {
+    output
+        .lines()
+        .filter_map(|line| {
+            let mut parts = line.splitn(3, '\t');
+            let head = parts.next()?;
+            let refname = parts.next()?;
+            let subject = parts.next()?;
+            if !subject.starts_with("branch: Created from ") {
+                return None;
+            }
+            let branch = refname.strip_prefix("refs/heads/")?.split_once("@{")?.0;
+            Some((branch.to_string(), head.to_string()))
+        })
+        .collect()
 }
 
 fn protected_branches_for_default(default_local: &str) -> HashSet<String> {
@@ -486,11 +579,7 @@ fn cleanup_reasons(input: &CleanupInput) -> Vec<&'static str> {
     if input.upstream_gone {
         values.push("gone");
     }
-    values.push(if input.merged_to_default {
-        "merged"
-    } else {
-        "unmerged"
-    });
+    values.push(input.default_relation.reason());
     if input.is_dirty {
         values.push("dirty");
     }
@@ -780,7 +869,7 @@ fn render_cleanup_selector(frame: &mut Frame<'_>, state: &CleanupSelectorState) 
 }
 
 fn delete_cleanup_candidate(input: &CleanupInput, force: bool) -> Result<()> {
-    if !force && !input.merged_to_default {
+    if !force && !input.default_relation.is_safe_to_delete() {
         return Err(anyhow!(
             "refusing to delete unmerged branch without --force: {}",
             input.branch
@@ -809,6 +898,8 @@ struct CleanupRecord<'a> {
     upstream_gone: bool,
     #[serde(rename = "mergedToDefault")]
     merged_to_default: bool,
+    #[serde(rename = "defaultRelation")]
+    default_relation: DefaultBranchRelation,
     dirty: bool,
     current: bool,
     #[serde(rename = "mainWorktree")]
@@ -837,7 +928,8 @@ fn print_cleanup_json(inputs: &[CleanupInput], force: bool) -> Result<()> {
                 worktree_path: input.worktree_path.as_deref(),
                 disposition,
                 upstream_gone: input.upstream_gone,
-                merged_to_default: input.merged_to_default,
+                merged_to_default: input.default_relation.is_merged(),
+                default_relation: input.default_relation,
                 dirty: input.is_dirty,
                 current: input.is_current_worktree,
                 main_worktree: input.is_main_worktree,
@@ -978,6 +1070,30 @@ mod tests {
     }
 
     #[test]
+    fn branch_creation_heads_parse_only_local_branch_creation_entries() {
+        let output = "\
+abc123\trefs/heads/feature/work@{0}\tcommit: work
+def456\trefs/heads/feature/work@{1}\tbranch: Created from HEAD
+def456\trefs/heads/feature/fresh@{0}\tbranch: Created from refs/remotes/origin/main
+def456\trefs/remotes/origin/feature/remote@{0}\tbranch: Created from HEAD
+def456\tHEAD@{0}\tcheckout: moving from feature/fresh to main
+";
+
+        let heads = parse_branch_creation_heads(output);
+
+        assert_eq!(
+            heads.get("feature/work").map(String::as_str),
+            Some("def456")
+        );
+        assert_eq!(
+            heads.get("feature/fresh").map(String::as_str),
+            Some("def456")
+        );
+        assert!(!heads.contains_key("feature/remote"));
+        assert!(!heads.contains_key("HEAD"));
+    }
+
+    #[test]
     fn renders_cleanup_selector_snapshot() {
         let inputs = [
             CleanupInput {
@@ -987,7 +1103,7 @@ mod tests {
                 is_main_worktree: false,
                 is_dirty: false,
                 upstream_gone: false,
-                merged_to_default: true,
+                default_relation: DefaultBranchRelation::Merged,
             },
             CleanupInput {
                 branch: "feature/gone".to_string(),
@@ -996,7 +1112,7 @@ mod tests {
                 is_main_worktree: false,
                 is_dirty: false,
                 upstream_gone: true,
-                merged_to_default: false,
+                default_relation: DefaultBranchRelation::Unmerged,
             },
         ];
         let input_refs: Vec<_> = inputs.iter().collect();
@@ -1020,7 +1136,7 @@ mod tests {
                 is_main_worktree: false,
                 is_dirty: false,
                 upstream_gone: true,
-                merged_to_default: false,
+                default_relation: DefaultBranchRelation::Unmerged,
             })
             .collect()
     }
