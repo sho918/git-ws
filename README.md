@@ -84,8 +84,8 @@ the short cache was used, for example `done 8ms (cache hit)`.
 When `--prs` is set, list output includes PR status and URL. PR lookups are
 cached for five minutes under `$XDG_CACHE_HOME/git-ws/pr-cache-v3` or
 `$HOME/.cache/git-ws/pr-cache-v3`; use `--refresh-prs` to bypass the cache.
-`git ws cleanup --json` keeps the existing fields and adds `reasons`,
-`eligible`, `requiresForce`, and `action`.
+`git ws cleanup --json` keeps the existing fields and adds `defaultRelation`,
+`reasons`, `eligible`, `requiresForce`, and `action`.
 
 ## Repository Config
 
