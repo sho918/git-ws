@@ -569,7 +569,7 @@ exit 1
 }
 
 #[test]
-fn list_prs_prints_status_and_url_for_local_branches() {
+fn list_prs_prints_status_without_url_for_local_branches() {
     let repo = TestRepo::with_remote();
     repo.create_remote_branch("feature/pr-head");
     git(
@@ -609,7 +609,7 @@ exit 1
     );
     assert!(stdout.contains("#7 open"), "{stdout}");
     assert!(
-        stdout.contains("https://github.com/owner/repo/pull/7"),
+        !stdout.contains("https://github.com/owner/repo/pull/7"),
         "{stdout}"
     );
     assert!(
@@ -619,7 +619,7 @@ exit 1
 }
 
 #[test]
-fn list_prs_prints_status_and_url_for_remote_only_branches() {
+fn list_prs_prints_status_without_url_for_remote_only_branches() {
     let repo = TestRepo::with_remote();
     repo.create_remote_branch("feature/remote-only-pr");
     git(repo.path(), ["branch", "-D", "feature/remote-only-pr"]);
@@ -660,7 +660,7 @@ exit 1
     );
     assert!(stdout.contains("#11 open"), "{stdout}");
     assert!(
-        stdout.contains("https://github.com/owner/repo/pull/11"),
+        !stdout.contains("https://github.com/owner/repo/pull/11"),
         "{stdout}"
     );
 }

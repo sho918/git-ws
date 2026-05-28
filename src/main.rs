@@ -166,7 +166,7 @@ fn cmd_list(args: Vec<OsString>) -> Result<()> {
             if let Some(pull_requests) = pull_requests.as_ref() {
                 let pull_request = candidate_pull_request(&candidate, pull_requests);
                 println!(
-                    "{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}",
+                    "{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}",
                     candidate.availability_label(),
                     candidate.name,
                     candidate.upstream_label(),
@@ -174,7 +174,6 @@ fn cmd_list(args: Vec<OsString>) -> Result<()> {
                     candidate.head_label(),
                     candidate.path_label(),
                     pull_request_label(pull_request),
-                    pull_request_url(pull_request),
                     candidate.action_label()
                 );
             } else {
@@ -373,9 +372,7 @@ fn print_candidate_table(
         println!(
             "{}",
             plain_row(
-                &[
-                    "Status", "Name", "Upstream", "Track", "Head", "Path", "PR", "URL",
-                ],
+                &["Status", "Name", "Upstream", "Track", "Head", "Path", "PR"],
                 &widths,
             )
         );
@@ -401,18 +398,17 @@ fn print_candidate_table(
 }
 
 fn list_table_widths(with_prs: bool) -> Vec<usize> {
-    let terminal_width = terminal_columns(if with_prs { 180 } else { 140 });
+    let terminal_width = terminal_columns(if with_prs { 160 } else { 140 });
     if with_prs {
         fit_priority_column_widths(
             &[
                 ColumnWidth::fixed(9),
-                ColumnWidth::new(28, 12, 1, 1),
-                ColumnWidth::new(24, 10, 1, 2),
+                ColumnWidth::new(34, 12, 1, 1),
+                ColumnWidth::new(30, 10, 1, 2),
                 ColumnWidth::new(12, 8, 1, 3),
                 ColumnWidth::fixed(7),
-                ColumnWidth::new(28, 8, 3, 5),
+                ColumnWidth::new(40, 8, 3, 5),
                 ColumnWidth::fixed(12),
-                ColumnWidth::new(16, 8, 4, 6),
             ],
             terminal_width,
         )
@@ -473,7 +469,6 @@ fn candidate_pr_row(
         pad_truncate(candidate.head_label(), widths[4]),
         color_path(candidate, widths[5]),
         linked_pull_request(pull_request, widths[6]),
-        pad_truncate(pull_request_url(pull_request), widths[7]),
     ]
     .join(" ")
 }
@@ -561,10 +556,6 @@ fn pull_request_label(pull_request: Option<&BranchPullRequestInfo>) -> String {
     pull_request
         .map(BranchPullRequestInfo::label)
         .unwrap_or_else(|| "-".to_string())
-}
-
-fn pull_request_url(pull_request: Option<&BranchPullRequestInfo>) -> &str {
-    pull_request.map(|value| value.url.as_str()).unwrap_or("-")
 }
 
 fn color_pull_request(pull_request: Option<&BranchPullRequestInfo>, width: usize) -> String {
@@ -836,7 +827,7 @@ Usage:
 
 Run open, issue, or pr without a target to use the interactive fuzzy picker.
 TTY views show colored status columns; non-TTY and JSON output stay plain.
-list --json adds tracking/action fields; list --prs adds PR status/URL with a short cache.
+list --json adds tracking/action fields; --prs adds PR status and JSON metadata with a short cache.
 cleanup --json adds eligibility/action fields.
 Use `git ws open --type remote` to pick from remote branches only.
 "#
@@ -888,15 +879,11 @@ mod tests {
             url: "https://github.com/owner/repo/pull/1234567890".to_string(),
         };
 
-        let row = candidate_pr_row(
-            &candidate,
-            Some(&pull_request),
-            &[7, 12, 10, 8, 7, 8, 6, 12],
-        );
+        let row = candidate_pr_row(&candidate, Some(&pull_request), &[7, 12, 10, 8, 7, 8, 6]);
 
         assert!(row.contains('…'), "{row}");
         assert!(!row.contains("super-long-branch-name-that-breaks"), "{row}");
-        assert!(row.contains("https://git…"), "{row}");
+        assert!(!row.contains(" https://"), "{row}");
     }
 
     #[test]
@@ -927,17 +914,14 @@ mod tests {
             url: "https://github.com/owner/repo/pull/419".to_string(),
         };
 
-        let row = candidate_pr_row(
-            &candidate,
-            Some(&pull_request),
-            &[7, 16, 16, 10, 7, 8, 9, 12],
-        );
+        let row = candidate_pr_row(&candidate, Some(&pull_request), &[7, 16, 16, 10, 7, 8, 9]);
 
         assert!(
             row.contains("\x1b]8;;https://github.com/owner/repo/pull/419\x1b\\"),
             "{row:?}"
         );
         assert!(row.contains("#419 open"), "{row:?}");
+        assert!(!row.contains(" https://"), "{row:?}");
         assert!(row.contains("\x1b]8;;\x1b\\"), "{row:?}");
     }
 
