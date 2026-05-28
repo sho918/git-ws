@@ -63,7 +63,7 @@ git ws open --type remote
 Interactive and TTY table views show dense columns for the selected workflow:
 
 - `git ws` and `git ws list`: status, branch name, upstream, tracking state,
-  head, and path. `git ws list --prs` also shows PR status and URL.
+  head, and path. `git ws list --prs` also shows clickable PR status.
 - `git ws issue`: number, title, author, labels, updated date, and planned
   branch.
 - `git ws pr`: number, title, author, head, base, review state, and updated
@@ -81,7 +81,8 @@ remains usable for the table or JSON payload. PR lookup progress reports whether
 the short cache was used, for example `done 8ms (cache hit)`.
 
 `git ws list --json` keeps the existing fields and adds `tracking` and `action`.
-When `--prs` is set, list output includes PR status and URL. PR lookups are
+When `--prs` is set, text output includes PR status and JSON includes PR
+metadata such as URL. PR lookups are
 cached for five minutes under `$XDG_CACHE_HOME/git-ws/pr-cache-v3` or
 `$HOME/.cache/git-ws/pr-cache-v3`; use `--refresh-prs` to bypass the cache.
 `git ws cleanup --json` keeps the existing fields and adds `defaultRelation`,
