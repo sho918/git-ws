@@ -584,8 +584,8 @@ fn list_prs_prints_status_without_url_for_local_branches() {
     let cache_home = tempfile::tempdir().expect("cache home");
     let fake_bin = fake_gh(
         r#"
-if [ "$1" = "pr" ] && [ "$2" = "list" ]; then
-  printf '[{"number":7,"title":"Add PR worktree","headRefName":"feature/pr-head","baseRefName":"main","state":"OPEN","isDraft":false,"updatedAt":"2026-05-10T12:00:00Z","url":"https://github.com/owner/repo/pull/7"}]'
+if [ "$1" = "api" ] && [ "$2" = "graphql" ] && echo "$*" | grep -q 'h0=feature/pr-head'; then
+  printf '{"data":{"repository":{"b0":{"nodes":[{"number":7,"title":"Add PR worktree","headRefName":"feature/pr-head","baseRefName":"main","state":"OPEN","isDraft":false,"updatedAt":"2026-05-10T12:00:00Z","url":"https://github.com/owner/repo/pull/7"}]}}}}'
   exit 0
 fi
 printf 'unexpected gh args: %s\n' "$*" >&2
@@ -635,8 +635,8 @@ fn list_prs_prints_status_without_url_for_remote_only_branches() {
     let cache_home = tempfile::tempdir().expect("cache home");
     let fake_bin = fake_gh(
         r#"
-if [ "$1" = "pr" ] && [ "$2" = "list" ]; then
-  printf '[{"number":11,"title":"Remote PR","headRefName":"feature/remote-only-pr","baseRefName":"main","state":"OPEN","isDraft":false,"updatedAt":"2026-05-13T12:00:00Z","url":"https://github.com/owner/repo/pull/11"}]'
+if [ "$1" = "api" ] && [ "$2" = "graphql" ] && echo "$*" | grep -q 'h0=feature/remote-only-pr'; then
+  printf '{"data":{"repository":{"b0":{"nodes":[{"number":11,"title":"Remote PR","headRefName":"feature/remote-only-pr","baseRefName":"main","state":"OPEN","isDraft":false,"updatedAt":"2026-05-13T12:00:00Z","url":"https://github.com/owner/repo/pull/11"}]}}}}'
   exit 0
 fi
 printf 'unexpected gh args: %s\n' "$*" >&2
@@ -681,13 +681,9 @@ fn list_prs_queries_each_head_branch_instead_of_only_the_first_repo_page() {
     let cache_home = tempfile::tempdir().expect("cache home");
     let fake_bin = fake_gh(
         r#"
-if [ "$1" = "pr" ] && [ "$2" = "list" ] && [ "$6" = "feature/pr-head" ]; then
-    printf '[{"number":12,"title":"Head PR","headRefName":"feature/pr-head","baseRefName":"main","state":"OPEN","isDraft":false,"updatedAt":"2026-05-14T12:00:00Z","url":"https://github.com/owner/repo/pull/12"}]'
+if [ "$1" = "api" ] && [ "$2" = "graphql" ] && echo "$*" | grep -q 'h0=feature/pr-head'; then
+    printf '{"data":{"repository":{"b0":{"nodes":[{"number":12,"title":"Head PR","headRefName":"feature/pr-head","baseRefName":"main","state":"OPEN","isDraft":false,"updatedAt":"2026-05-14T12:00:00Z","url":"https://github.com/owner/repo/pull/12"}]}}}}'
     exit 0
-fi
-if [ "$1" = "pr" ] && [ "$2" = "list" ] && [ "$5" = "--head" ]; then
-  printf '[]'
-  exit 0
 fi
 printf 'expected branch-scoped gh lookup, got: %s\n' "$*" >&2
 exit 1
@@ -708,6 +704,70 @@ exit 1
 }
 
 #[test]
+fn list_prs_passes_graphql_string_variables_as_raw_fields() {
+    let repo = TestRepo::with_remote();
+    repo.create_remote_branch("123");
+    git(
+        repo.path(),
+        [
+            "remote",
+            "add",
+            "github",
+            "https://github.com/owner/repo.git",
+        ],
+    );
+    let cache_home = tempfile::tempdir().expect("cache home");
+    let calls_path = cache_home.path().join("gh-calls");
+    let fake_bin = fake_gh(&format!(
+        r#"
+if [ "$1" = "api" ] && [ "$2" = "graphql" ]; then
+  printf '%s\n' "$*" >> '{}'
+  case " $* " in
+    *" -F "* )
+      printf 'GraphQL string variables must use raw fields\n' >&2
+      exit 2
+      ;;
+  esac
+  case " $* " in
+    *" -f owner=owner "* ) ;;
+    * ) printf 'missing raw owner field\n' >&2; exit 1 ;;
+  esac
+  case " $* " in
+    *" -f name=repo "* ) ;;
+    * ) printf 'missing raw name field\n' >&2; exit 1 ;;
+  esac
+  case " $* " in
+    *" -f h0=123 "* ) ;;
+    * ) printf 'missing raw branch field\n' >&2; exit 1 ;;
+  esac
+  printf '{{"data":{{"repository":{{"b0":{{"nodes":[{{"number":15,"title":"Numeric branch","headRefName":"123","baseRefName":"main","state":"OPEN","isDraft":false,"updatedAt":"2026-05-17T12:00:00Z","url":"https://github.com/owner/repo/pull/15"}}]}}}}}}}}'
+  exit 0
+fi
+printf 'unexpected gh args: %s\n' "$*" >&2
+exit 1
+"#,
+        calls_path.display()
+    ));
+
+    let output = Command::new(env!("CARGO_BIN_EXE_git-ws"))
+        .current_dir(repo.path())
+        .env("PATH", prepend_path(fake_bin.path()))
+        .env("XDG_CACHE_HOME", cache_home.path())
+        .args(["list", "--type", "local", "--prs", "--refresh-prs"])
+        .output()
+        .expect("run git-ws");
+
+    assert_success(&output);
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(
+        stdout.contains("#15 open"),
+        "stdout:\n{stdout}\nstderr:\n{}\ngh calls:\n{}",
+        String::from_utf8_lossy(&output.stderr),
+        fs::read_to_string(calls_path).unwrap_or_default()
+    );
+}
+
+#[test]
 fn list_prs_reuses_cached_pr_lookup() {
     let repo = TestRepo::with_remote();
     repo.create_remote_branch("feature/pr-cache");
@@ -724,13 +784,9 @@ fn list_prs_reuses_cached_pr_lookup() {
     let calls_path = cache_home.path().join("gh-calls");
     let fake_bin = fake_gh(&format!(
         r#"
-if [ "$1" = "pr" ] && [ "$2" = "list" ] && [ "$6" = "feature/pr-cache" ]; then
+if [ "$1" = "api" ] && [ "$2" = "graphql" ] && echo "$*" | grep -q 'h0=feature/pr-cache'; then
   printf call >> '{}'
-  printf '[{{"number":8,"title":"Cache PR","headRefName":"feature/pr-cache","baseRefName":"main","state":"MERGED","isDraft":false,"mergedAt":"2026-05-11T12:00:00Z","updatedAt":"2026-05-11T12:00:00Z","url":"https://github.com/owner/repo/pull/8"}}]'
-  exit 0
-fi
-if [ "$1" = "pr" ] && [ "$2" = "list" ] && [ "$5" = "--head" ]; then
-  printf '[]'
+  printf '{{"data":{{"repository":{{"b0":{{"nodes":[{{"number":8,"title":"Cache PR","headRefName":"feature/pr-cache","baseRefName":"main","state":"MERGED","isDraft":false,"mergedAt":"2026-05-11T12:00:00Z","updatedAt":"2026-05-11T12:00:00Z","url":"https://github.com/owner/repo/pull/8"}}]}}}}}}}}'
   exit 0
 fi
 printf 'unexpected gh args: %s\n' "$*" >&2
@@ -763,6 +819,168 @@ exit 1
 }
 
 #[test]
+fn list_prs_reuses_cached_branches_when_only_some_heads_are_missing() {
+    let repo = TestRepo::with_remote();
+    repo.create_remote_branch("feature/pr-cache");
+    git(
+        repo.path(),
+        [
+            "remote",
+            "add",
+            "github",
+            "https://github.com/owner/repo.git",
+        ],
+    );
+    let cache_home = tempfile::tempdir().expect("cache home");
+    let calls_path = cache_home.path().join("gh-calls");
+    let fake_bin = fake_gh(&format!(
+        r#"
+if [ "$1" = "api" ] && [ "$2" = "graphql" ]; then
+  printf '%s\n' "$*" >> '{}'
+  case "$*" in
+    *"h0=feature/pr-cache"* )
+      printf '{{"data":{{"repository":{{"b0":{{"nodes":[{{"number":8,"title":"Cache PR","headRefName":"feature/pr-cache","baseRefName":"main","state":"MERGED","isDraft":false,"mergedAt":"2026-05-11T12:00:00Z","updatedAt":"2026-05-11T12:00:00Z","url":"https://github.com/owner/repo/pull/8"}}]}}}}}}}}'
+      exit 0
+      ;;
+    *"h0=feature/pr-new"* )
+      printf '{{"data":{{"repository":{{"b0":{{"nodes":[{{"number":9,"title":"New PR","headRefName":"feature/pr-new","baseRefName":"main","state":"OPEN","isDraft":false,"updatedAt":"2026-05-12T12:00:00Z","url":"https://github.com/owner/repo/pull/9"}}]}}}}}}}}'
+      exit 0
+      ;;
+  esac
+fi
+printf 'unexpected gh args: %s\n' "$*" >&2
+exit 1
+"#,
+        calls_path.display()
+    ));
+
+    let first = Command::new(env!("CARGO_BIN_EXE_git-ws"))
+        .current_dir(repo.path())
+        .env("PATH", prepend_path(fake_bin.path()))
+        .env("XDG_CACHE_HOME", cache_home.path())
+        .args(["list", "--type", "local", "--prs"])
+        .output()
+        .expect("run git-ws");
+
+    assert_success(&first);
+    assert!(
+        String::from_utf8_lossy(&first.stdout).contains("#8 merged"),
+        "stdout:\n{}",
+        String::from_utf8_lossy(&first.stdout)
+    );
+
+    repo.create_remote_branch("feature/pr-new");
+    let second = Command::new(env!("CARGO_BIN_EXE_git-ws"))
+        .current_dir(repo.path())
+        .env("PATH", prepend_path(fake_bin.path()))
+        .env("XDG_CACHE_HOME", cache_home.path())
+        .args(["list", "--type", "local", "--prs"])
+        .output()
+        .expect("run git-ws");
+
+    assert_success(&second);
+    let stdout = String::from_utf8_lossy(&second.stdout);
+    assert!(stdout.contains("#8 merged"), "{stdout}");
+    assert!(stdout.contains("#9 open"), "{stdout}");
+    let calls = fs::read_to_string(calls_path).expect("read calls");
+    assert_eq!(
+        calls.matches("feature/pr-cache").count(),
+        1,
+        "cached branch should not be fetched again:\n{calls}"
+    );
+    assert_eq!(
+        calls.matches("feature/pr-new").count(),
+        1,
+        "new branch should be fetched once:\n{calls}"
+    );
+}
+
+#[test]
+fn cleanup_pr_lookup_only_queries_gone_branches_unmerged_by_git() {
+    let repo = TestRepo::with_remote();
+    repo.create_remote_branch("feature/git-merged");
+    git(repo.path(), ["switch", "main"]);
+    git(
+        repo.path(),
+        [
+            "merge",
+            "--no-ff",
+            "feature/git-merged",
+            "-m",
+            "merge git-merged",
+        ],
+    );
+    git(repo.path(), ["push", "origin", "main"]);
+    git(repo.remote_path(), ["branch", "-D", "feature/git-merged"]);
+    git(repo.path(), ["fetch", "--prune", "origin"]);
+
+    repo.create_remote_branch("feature/squash-merged");
+    git(repo.path(), ["switch", "feature/squash-merged"]);
+    fs::write(repo.path().join("local-only.txt"), "local\n").expect("write local change");
+    git(repo.path(), ["add", "local-only.txt"]);
+    git(repo.path(), ["commit", "-m", "local only"]);
+    let local_head =
+        String::from_utf8_lossy(&git(repo.path(), ["rev-parse", "feature/squash-merged"]).stdout)
+            .trim()
+            .to_string();
+    git(repo.path(), ["switch", "main"]);
+    git(
+        repo.remote_path(),
+        ["branch", "-D", "feature/squash-merged"],
+    );
+    git(repo.path(), ["fetch", "--prune", "origin"]);
+    git(
+        repo.path(),
+        [
+            "remote",
+            "add",
+            "github",
+            "https://github.com/owner/repo.git",
+        ],
+    );
+    let cache_home = tempfile::tempdir().expect("cache home");
+    let calls_path = cache_home.path().join("gh-calls");
+    let fake_bin = fake_gh(&format!(
+        r#"
+if [ "$1" = "api" ] && [ "$2" = "graphql" ]; then
+  printf '%s\n' "$*" >> '{}'
+  case "$*" in
+    *"feature/git-merged"* )
+      printf 'git-merged branch should not be queried\n' >&2
+      exit 1
+      ;;
+    *"h0=feature/squash-merged"* )
+      printf '{{"data":{{"repository":{{"b0":{{"nodes":[{{"number":9,"title":"Squash merged","headRefName":"feature/squash-merged","headRefOid":"{}","headRepository":{{"nameWithOwner":"owner/repo"}},"baseRefName":"main","state":"MERGED","isDraft":false,"mergedAt":"2026-05-12T12:00:00Z","updatedAt":"2026-05-12T12:00:00Z","url":"https://github.com/owner/repo/pull/9"}}]}}}}}}}}'
+      exit 0
+      ;;
+  esac
+fi
+printf 'unexpected gh args: %s\n' "$*" >&2
+exit 1
+"#,
+        calls_path.display(),
+        local_head
+    ));
+
+    let output = Command::new(env!("CARGO_BIN_EXE_git-ws"))
+        .current_dir(repo.path())
+        .env("PATH", prepend_path(fake_bin.path()))
+        .env("XDG_CACHE_HOME", cache_home.path())
+        .args(["cleanup", "--yes"])
+        .output()
+        .expect("run git-ws");
+
+    assert_success(&output);
+    let branches = git(repo.path(), ["branch", "--list", "feature/*"]);
+    let stdout = String::from_utf8_lossy(&branches.stdout);
+    assert!(!stdout.contains("feature/git-merged"), "{stdout}");
+    assert!(!stdout.contains("feature/squash-merged"), "{stdout}");
+    let calls = fs::read_to_string(calls_path).expect("read calls");
+    assert!(calls.contains("feature/squash-merged"), "{calls}");
+    assert!(!calls.contains("feature/git-merged"), "{calls}");
+}
+
+#[test]
 fn cleanup_yes_deletes_unmerged_gone_branch_when_merged_pr_matches_default() {
     let repo = TestRepo::with_remote();
     repo.create_remote_branch("feature/squash-merged");
@@ -792,8 +1010,8 @@ fn cleanup_yes_deletes_unmerged_gone_branch_when_merged_pr_matches_default() {
     let cache_home = tempfile::tempdir().expect("cache home");
     let fake_bin = fake_gh(&format!(
         r#"
-if [ "$1" = "pr" ] && [ "$2" = "list" ]; then
-  printf '[{{"number":9,"title":"Squash merged","headRefName":"feature/squash-merged","headRefOid":"{}","headRepository":{{"nameWithOwner":"owner/repo"}},"baseRefName":"main","state":"MERGED","isDraft":false,"mergedAt":"2026-05-12T12:00:00Z","updatedAt":"2026-05-12T12:00:00Z","url":"https://github.com/owner/repo/pull/9"}}]'
+if [ "$1" = "api" ] && [ "$2" = "graphql" ] && echo "$*" | grep -q 'h0=feature/squash-merged'; then
+  printf '{{"data":{{"repository":{{"b0":{{"nodes":[{{"number":9,"title":"Squash merged","headRefName":"feature/squash-merged","headRefOid":"{}","headRepository":{{"nameWithOwner":"owner/repo"}},"baseRefName":"main","state":"MERGED","isDraft":false,"mergedAt":"2026-05-12T12:00:00Z","updatedAt":"2026-05-12T12:00:00Z","url":"https://github.com/owner/repo/pull/9"}}]}}}}}}}}'
   exit 0
 fi
 printf 'unexpected gh args: %s\n' "$*" >&2
@@ -845,8 +1063,8 @@ fn cleanup_yes_keeps_gone_branch_when_merged_pr_head_does_not_match_local_branch
     let cache_home = tempfile::tempdir().expect("cache home");
     let fake_bin = fake_gh(&format!(
         r#"
-if [ "$1" = "pr" ] && [ "$2" = "list" ]; then
-  printf '[{{"number":13,"title":"Reused branch","headRefName":"feature/reused-pr-head","headRefOid":"{}","headRepository":{{"nameWithOwner":"owner/repo"}},"baseRefName":"main","state":"MERGED","isDraft":false,"mergedAt":"2026-05-15T12:00:00Z","updatedAt":"2026-05-15T12:00:00Z","url":"https://github.com/owner/repo/pull/13"}}]'
+if [ "$1" = "api" ] && [ "$2" = "graphql" ] && echo "$*" | grep -q 'h0=feature/reused-pr-head'; then
+  printf '{{"data":{{"repository":{{"b0":{{"nodes":[{{"number":13,"title":"Reused branch","headRefName":"feature/reused-pr-head","headRefOid":"{}","headRepository":{{"nameWithOwner":"owner/repo"}},"baseRefName":"main","state":"MERGED","isDraft":false,"mergedAt":"2026-05-15T12:00:00Z","updatedAt":"2026-05-15T12:00:00Z","url":"https://github.com/owner/repo/pull/13"}}]}}}}}}}}'
   exit 0
 fi
 printf 'unexpected gh args: %s\n' "$*" >&2
@@ -902,8 +1120,8 @@ fn cleanup_yes_keeps_gone_branch_when_merged_pr_head_repository_does_not_match()
     let cache_home = tempfile::tempdir().expect("cache home");
     let fake_bin = fake_gh(&format!(
         r#"
-if [ "$1" = "pr" ] && [ "$2" = "list" ]; then
-  printf '[{{"number":14,"title":"Fork collision","headRefName":"feature/fork-name-collision","headRefOid":"{}","headRepository":{{"nameWithOwner":"contributor/repo"}},"baseRefName":"main","state":"MERGED","isDraft":false,"mergedAt":"2026-05-16T12:00:00Z","updatedAt":"2026-05-16T12:00:00Z","url":"https://github.com/owner/repo/pull/14"}}]'
+if [ "$1" = "api" ] && [ "$2" = "graphql" ] && echo "$*" | grep -q 'h0=feature/fork-name-collision'; then
+  printf '{{"data":{{"repository":{{"b0":{{"nodes":[{{"number":14,"title":"Fork collision","headRefName":"feature/fork-name-collision","headRefOid":"{}","headRepository":{{"nameWithOwner":"contributor/repo"}},"baseRefName":"main","state":"MERGED","isDraft":false,"mergedAt":"2026-05-16T12:00:00Z","updatedAt":"2026-05-16T12:00:00Z","url":"https://github.com/owner/repo/pull/14"}}]}}}}}}}}'
   exit 0
 fi
 printf 'unexpected gh args: %s\n' "$*" >&2
@@ -954,8 +1172,8 @@ fn cleanup_yes_keeps_gone_branch_when_merged_pr_targets_other_base() {
     let cache_home = tempfile::tempdir().expect("cache home");
     let fake_bin = fake_gh(
         r#"
-if [ "$1" = "pr" ] && [ "$2" = "list" ]; then
-  printf '[{"number":10,"title":"Other base","headRefName":"feature/other-base","baseRefName":"develop","state":"MERGED","isDraft":false,"mergedAt":"2026-05-12T12:00:00Z","updatedAt":"2026-05-12T12:00:00Z","url":"https://github.com/owner/repo/pull/10"}]'
+if [ "$1" = "api" ] && [ "$2" = "graphql" ] && echo "$*" | grep -q 'h0=feature/other-base'; then
+  printf '{"data":{"repository":{"b0":{"nodes":[{"number":10,"title":"Other base","headRefName":"feature/other-base","baseRefName":"develop","state":"MERGED","isDraft":false,"mergedAt":"2026-05-12T12:00:00Z","updatedAt":"2026-05-12T12:00:00Z","url":"https://github.com/owner/repo/pull/10"}]}}}}'
   exit 0
 fi
 printf 'unexpected gh args: %s\n' "$*" >&2

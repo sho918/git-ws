@@ -248,14 +248,8 @@ pub fn discover_cleanup_candidates_with_progress(progress: Progress) -> Result<V
         .to_string();
     let protected = protected_branches_for_default(default_local);
 
-    let pr_branches: Vec<&str> = local
-        .iter()
-        .filter(|branch| branch.upstream_gone && !protected.contains(&branch.name))
-        .map(|branch| branch.name.as_str())
-        .collect();
-
-    let (merged, creation_heads, dirty_paths, pull_requests, github_repository) =
-        thread::scope(|scope| {
+    let (git_relations, dirty_paths, pull_requests, github_repository) =
+        thread::scope(|scope| -> Result<_> {
             let merged = scope.spawn(|| {
                 progress.run_result("loading default-merged branches", || {
                     merged_branches(&default)
@@ -265,40 +259,77 @@ pub fn discover_cleanup_candidates_with_progress(progress: Progress) -> Result<V
                 progress.run_result("loading branch creation heads", branch_creation_heads)
             });
             let dirty = scope.spawn(|| check_worktrees_dirty_with_progress(&worktrees, progress));
-            let pull_requests = scope.spawn(|| {
-                let step = progress.step(format!(
-                    "loading PRs for {} gone branch(es)",
-                    pr_branches.len()
-                ));
-                match load_branch_pull_requests_with_status(&pr_branches, false) {
-                    Ok(lookup) => {
-                        step.done_with_note(lookup.cache_status.progress_note());
-                        lookup.pull_requests
-                    }
-                    Err(_) => {
-                        step.failed();
-                        HashMap::new()
-                    }
-                }
-            });
             let github_repository = scope.spawn(|| {
                 progress
                     .run_result("resolving GitHub repository", current_git_remote_repository)
                     .ok()
                     .flatten()
             });
-            (
-                merged.join().expect("merged_branches thread"),
-                creation_heads.join().expect("branch_creation_heads thread"),
-                dirty.join().expect("check_worktrees_dirty thread"),
-                pull_requests.join().expect("pull_requests thread"),
-                github_repository
-                    .join()
-                    .expect("current_git_remote_repository thread"),
-            )
-        });
-    let merged: HashSet<String> = merged?.into_iter().collect();
-    let creation_heads = creation_heads?;
+            let merged = merged
+                .join()
+                .expect("merged_branches thread")
+                .map(|branches| branches.into_iter().collect::<HashSet<_>>());
+            let creation_heads = creation_heads.join().expect("branch_creation_heads thread");
+            let (git_relations, pull_requests, early_error) = match (merged, creation_heads) {
+                (Ok(merged), Ok(creation_heads)) => {
+                    let git_relations: HashMap<String, DefaultBranchRelation> = local
+                        .iter()
+                        .map(|branch| {
+                            (
+                                branch.name.clone(),
+                                default_branch_relation(
+                                    branch,
+                                    &merged,
+                                    &creation_heads,
+                                    &default_head,
+                                ),
+                            )
+                        })
+                        .collect();
+                    let pr_branches: Vec<&str> = local
+                        .iter()
+                        .filter(|branch| {
+                            branch.upstream_gone
+                                && !protected.contains(&branch.name)
+                                && git_relations
+                                    .get(&branch.name)
+                                    .copied()
+                                    .unwrap_or(DefaultBranchRelation::Unmerged)
+                                    == DefaultBranchRelation::Unmerged
+                        })
+                        .map(|branch| branch.name.as_str())
+                        .collect();
+                    let pull_requests = if pr_branches.is_empty() {
+                        HashMap::new()
+                    } else {
+                        let step = progress.step(format!(
+                            "loading PRs for {} gone branch(es)",
+                            pr_branches.len()
+                        ));
+                        match load_branch_pull_requests_with_status(&pr_branches, false) {
+                            Ok(lookup) => {
+                                step.done_with_note(lookup.cache_status.progress_note());
+                                lookup.pull_requests
+                            }
+                            Err(_) => {
+                                step.failed();
+                                HashMap::new()
+                            }
+                        }
+                    };
+                    (git_relations, pull_requests, None)
+                }
+                (Err(error), _) | (_, Err(error)) => (HashMap::new(), HashMap::new(), Some(error)),
+            };
+            let dirty_paths = dirty.join().expect("check_worktrees_dirty thread");
+            let github_repository = github_repository
+                .join()
+                .expect("current_git_remote_repository thread");
+            if let Some(error) = early_error {
+                return Err(error);
+            }
+            Ok((git_relations, dirty_paths, pull_requests, github_repository))
+        })?;
 
     let worktree_by_branch: HashMap<&str, &crate::git::Worktree> = worktrees
         .iter()
@@ -323,7 +354,10 @@ pub fn discover_cleanup_candidates_with_progress(progress: Progress) -> Result<V
             }) {
                 DefaultBranchRelation::Merged
             } else {
-                default_branch_relation(&branch, &merged, &creation_heads, &default_head)
+                git_relations
+                    .get(&branch.name)
+                    .copied()
+                    .unwrap_or(DefaultBranchRelation::Unmerged)
             };
             CleanupInput {
                 upstream_gone: branch.upstream_gone,

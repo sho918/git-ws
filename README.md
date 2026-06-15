@@ -78,15 +78,19 @@ and ahead states are blue. Non-TTY output and JSON never include ANSI color
 codes. Long values in TTY tables are truncated with `…` to keep columns aligned.
 Long-running TTY list and cleanup operations print progress to stderr so stdout
 remains usable for the table or JSON payload. PR lookup progress reports whether
-the short cache was used, for example `done 8ms (cache hit)`.
+the short cache was used, for example `done 8ms (cache hit)` or
+`done 40ms (cache partial hit)`.
 
 `git ws list --json` keeps the existing fields and adds `tracking` and `action`.
 When `--prs` is set, text output includes PR status and JSON includes PR
 metadata such as URL. PR lookups are
 cached for five minutes under `$XDG_CACHE_HOME/git-ws/pr-cache-v3` or
-`$HOME/.cache/git-ws/pr-cache-v3`; use `--refresh-prs` to bypass the cache.
-`git ws cleanup --json` keeps the existing fields and adds `defaultRelation`,
-`reasons`, `eligible`, `requiresForce`, and `action`.
+`$HOME/.cache/git-ws/pr-cache-v3`; fresh cached entries are reused per branch,
+and only missing heads are fetched. Use `--refresh-prs` to bypass the cache.
+`git ws cleanup` uses GitHub PR lookup only for gone branches that local Git
+cannot already prove merged or unchanged. `git ws cleanup --json` keeps the
+existing fields and adds `defaultRelation`, `reasons`, `eligible`,
+`requiresForce`, and `action`.
 
 ## Repository Config
 
