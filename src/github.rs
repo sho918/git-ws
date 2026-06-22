@@ -104,6 +104,7 @@ impl BranchPullRequestInfo {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum PullRequestCacheStatus {
     Hit,
+    PartialHit,
     Miss,
     Refresh,
     NoGitHubRemote,
@@ -113,6 +114,7 @@ impl PullRequestCacheStatus {
     pub fn progress_note(self) -> &'static str {
         match self {
             PullRequestCacheStatus::Hit => "cache hit",
+            PullRequestCacheStatus::PartialHit => "cache partial hit",
             PullRequestCacheStatus::Miss => "cache miss",
             PullRequestCacheStatus::Refresh => "cache refresh",
             PullRequestCacheStatus::NoGitHubRemote => "no GitHub remote",
@@ -163,6 +165,7 @@ struct PullRequestCache {
 }
 
 const PR_CACHE_TTL_SECS: u64 = 300;
+const PR_GRAPHQL_BATCH_SIZE: usize = 10;
 
 pub fn create_issue_worktree(
     id: &str,
@@ -282,10 +285,27 @@ pub fn load_branch_pull_requests_with_status(
     let cached = if refresh {
         None
     } else {
-        read_fresh_pr_cache(&repository, &branches)
+        read_fresh_pr_cache(&repository)
     };
     let (pull_requests, cache_status) = if let Some(cached) = cached {
-        (cached?, PullRequestCacheStatus::Hit)
+        let mut cache = cached?.branches;
+        let missing: Vec<String> = branches
+            .iter()
+            .filter(|branch| !cache.contains_key(*branch))
+            .cloned()
+            .collect();
+        if missing.is_empty() {
+            (
+                flatten_cached_pull_requests(&cache, &branches),
+                PullRequestCacheStatus::Hit,
+            )
+        } else {
+            let fetched = fetch_branch_pull_requests(&repository, &missing)?;
+            cache.extend(fetched);
+            let values = flatten_cached_pull_requests(&cache, &branches);
+            write_pr_cache(&repository, cache).ok();
+            (values, PullRequestCacheStatus::PartialHit)
+        }
     } else {
         let cache = fetch_branch_pull_requests(&repository, &branches)?;
         let values = flatten_cached_pull_requests(&cache, &branches);
@@ -448,6 +468,20 @@ fn gh_json<const N: usize, T: for<'de> Deserialize<'de>>(args: [&str; N]) -> Res
     serde_json::from_slice(&output.stdout).context("failed to parse gh JSON")
 }
 
+fn gh_json_args<T: for<'de> Deserialize<'de>>(args: &[String]) -> Result<T> {
+    let output = Command::new("gh")
+        .args(args)
+        .output()
+        .context("failed to spawn gh")?;
+    if !output.status.success() {
+        return Err(anyhow!(
+            "gh failed: {}",
+            String::from_utf8_lossy(&output.stderr).trim()
+        ));
+    }
+    serde_json::from_slice(&output.stdout).context("failed to parse gh JSON")
+}
+
 fn requested_branch_names(branches: &[&str]) -> Vec<String> {
     let mut values: Vec<String> = branches
         .iter()
@@ -465,34 +499,108 @@ fn fetch_branch_pull_requests(
     branches: &[String],
 ) -> Result<BTreeMap<String, Vec<BranchPullRequestInfo>>> {
     let mut values = BTreeMap::new();
-    for branch in branches {
-        values.insert(
-            branch.clone(),
-            fetch_branch_pull_requests_for_head(repository, branch)?,
-        );
+    for batch in branches.chunks(PR_GRAPHQL_BATCH_SIZE) {
+        values.extend(fetch_branch_pull_requests_batch(repository, batch)?);
     }
     Ok(values)
 }
 
-fn fetch_branch_pull_requests_for_head(
+#[derive(Debug, Deserialize)]
+struct GraphqlPullRequestResponse {
+    data: GraphqlPullRequestData,
+}
+
+#[derive(Debug, Deserialize)]
+struct GraphqlPullRequestData {
+    repository: Option<BTreeMap<String, GraphqlPullRequestConnection>>,
+}
+
+#[derive(Debug, Deserialize)]
+struct GraphqlPullRequestConnection {
+    nodes: Vec<RawBranchPullRequest>,
+}
+
+fn fetch_branch_pull_requests_batch(
     repository: &str,
-    branch: &str,
-) -> Result<Vec<BranchPullRequestInfo>> {
-    let raw: Vec<RawBranchPullRequest> = gh_json([
-        "pr",
-        "list",
-        "-R",
-        repository,
-        "--head",
-        branch,
-        "--state",
-        "all",
-        "--limit",
-        "100",
-        "--json",
-        "number,title,headRefName,headRefOid,headRepository,baseRefName,state,isDraft,mergedAt,closedAt,updatedAt,url",
-    ])?;
-    Ok(raw.into_iter().map(normalize_branch_pr).collect())
+    branches: &[String],
+) -> Result<BTreeMap<String, Vec<BranchPullRequestInfo>>> {
+    let (owner, name) = repository
+        .split_once('/')
+        .ok_or_else(|| anyhow!("invalid GitHub repository path {repository}"))?;
+    let query = branch_pull_requests_query(branches.len());
+    let mut args = vec![
+        "api".to_string(),
+        "graphql".to_string(),
+        "-f".to_string(),
+        format!("query={query}"),
+        "-f".to_string(),
+        format!("owner={owner}"),
+        "-f".to_string(),
+        format!("name={name}"),
+    ];
+    for (index, branch) in branches.iter().enumerate() {
+        args.push("-f".to_string());
+        args.push(format!("h{index}={branch}"));
+    }
+
+    let raw: GraphqlPullRequestResponse = gh_json_args(&args)?;
+    let mut repository = raw
+        .data
+        .repository
+        .ok_or_else(|| anyhow!("GitHub repository {repository} was not found"))?;
+    let mut values = BTreeMap::new();
+    for (index, branch) in branches.iter().enumerate() {
+        let alias = format!("b{index}");
+        let pull_requests = repository
+            .remove(&alias)
+            .map(|connection| {
+                connection
+                    .nodes
+                    .into_iter()
+                    .map(normalize_branch_pr)
+                    .collect()
+            })
+            .unwrap_or_default();
+        values.insert(branch.clone(), pull_requests);
+    }
+    Ok(values)
+}
+
+fn branch_pull_requests_query(batch_size: usize) -> String {
+    let variables = (0..batch_size)
+        .map(|index| format!("$h{index}: String!"))
+        .collect::<Vec<_>>()
+        .join(", ");
+    let lookups = (0..batch_size)
+        .map(|index| {
+            format!(
+                r#"b{index}: pullRequests(headRefName: $h{index}, states: [OPEN, CLOSED, MERGED], first: 100) {{
+      nodes {{
+        number
+        title
+        headRefName
+        headRefOid
+        headRepository {{ nameWithOwner }}
+        baseRefName
+        state
+        isDraft
+        mergedAt
+        closedAt
+        updatedAt
+        url
+      }}
+    }}"#
+            )
+        })
+        .collect::<Vec<_>>()
+        .join("\n    ");
+    format!(
+        r#"query($owner: String!, $name: String!, {variables}) {{
+  repository(owner: $owner, name: $name) {{
+    {lookups}
+  }}
+}}"#
+    )
 }
 
 fn normalize_branch_pr(raw: RawBranchPullRequest) -> BranchPullRequestInfo {
@@ -582,10 +690,7 @@ pub fn current_git_remote_repository() -> Result<Option<String>> {
     }))
 }
 
-fn read_fresh_pr_cache(
-    repository: &str,
-    branches: &[String],
-) -> Option<Result<Vec<BranchPullRequestInfo>>> {
+fn read_fresh_pr_cache(repository: &str) -> Option<Result<PullRequestCache>> {
     let path = pr_cache_path(repository)?;
     let modified = fs::metadata(&path)
         .and_then(|metadata| metadata.modified())
@@ -596,10 +701,7 @@ fn read_fresh_pr_cache(
     }
     let raw = fs::read(&path).ok()?;
     match serde_json::from_slice::<PullRequestCache>(&raw) {
-        Ok(cache) => branches
-            .iter()
-            .all(|branch| cache.branches.contains_key(branch))
-            .then(|| Ok(flatten_cached_pull_requests(&cache.branches, branches))),
+        Ok(cache) => Some(Ok(cache)),
         Err(error) => Some(Err(error).context("failed to parse PR cache")),
     }
 }
